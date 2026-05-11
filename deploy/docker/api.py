@@ -49,6 +49,9 @@ from utils import (
     validate_url_destination,
     validate_proxy_destination,
     scrub_browser_extra_args,
+    _deep_merge,
+    get_browser_config_dict,
+    get_run_config_dict,
 )
 from webhook import WebhookDeliveryService
 
@@ -337,20 +340,19 @@ async def handle_markdown_request(
         cache_mode = CacheMode.ENABLED if cache == "1" else CacheMode.WRITE_ONLY
 
         from crawler_pool import get_crawler, release_crawler
-        from utils import load_config as _load_config
-        _cfg = _load_config()
-        browser_cfg = BrowserConfig(
-            extra_args=_cfg["crawler"]["browser"].get("extra_args", []),
-            **_cfg["crawler"]["browser"].get("kwargs", {}),
+        browser_cfg = BrowserConfig.load(
+            _deep_merge(get_browser_config_dict(config), {})
         )
+        endpoint_overrides = {
+            "markdown_generator": md_generator,
+            "scraping_strategy": LXMLWebScrapingStrategy(),
+            "cache_mode": cache_mode,
+        }
+        run_dict = _deep_merge(get_run_config_dict(config), endpoint_overrides)
         crawler = await get_crawler(browser_cfg)
         result = await crawler.arun(
             url=decoded_url,
-            config=CrawlerRunConfig(
-                markdown_generator=md_generator,
-                scraping_strategy=LXMLWebScrapingStrategy(),
-                cache_mode=cache_mode
-            )
+            config=CrawlerRunConfig.load(run_dict)
         )
 
         if not result.success:
@@ -554,14 +556,14 @@ async def stream_results(crawler: AsyncWebCrawler, results_gen: AsyncGenerator) 
                 if result_dict.get('pdf') is not None:
                     result_dict['pdf'] = b64encode(result_dict['pdf']).decode('utf-8')
                 logger.info(f"Streaming result for {result_dict.get('url', 'unknown')}")
-                data = json.dumps(result_dict, default=datetime_handler) + "\n"
+                data = json.dumps(result_dict, default=datetime_handler, ensure_ascii=False) + "\n"
                 yield data.encode('utf-8')
             except Exception as e:
                 logger.error(f"Serialization error: {e}")
                 error_response = {"error": str(e), "url": getattr(result, 'url', 'unknown')}
-                yield (json.dumps(error_response) + "\n").encode('utf-8')
+                yield (json.dumps(error_response, ensure_ascii=False) + "\n").encode('utf-8')
 
-        yield json.dumps({"status": "completed"}).encode('utf-8')
+        yield json.dumps({"status": "completed"}, ensure_ascii=False).encode('utf-8')
         
     except asyncio.CancelledError:
         logger.warning("Client disconnected during streaming")
@@ -599,8 +601,12 @@ async def handle_crawl_request(
         urls = [('https://' + url) if not url.startswith(('http://', 'https://')) and not url.startswith(("raw:", "raw://")) else url for url in urls]
         for url in urls:
             validate_url_destination(url)
-        browser_config = BrowserConfig.load(browser_config)
-        crawler_config = CrawlerRunConfig.load(crawler_config)
+        browser_config = BrowserConfig.load(
+            _deep_merge(get_browser_config_dict(config), browser_config or {})
+        )
+        crawler_config = CrawlerRunConfig.load(
+            _deep_merge(get_run_config_dict(config), crawler_config or {})
+        )
         _enforce_proxy_safety(browser_config, crawler_config)
 
         dispatcher = MemoryAdaptiveDispatcher(
@@ -625,7 +631,7 @@ async def handle_crawl_request(
                 hook_manager=hook_manager
             )
             logger.info(f"Hooks attachment status: {hooks_status['status']}")
-        
+
         base_config = config["crawler"]["base_config"]
 
         # Build the config(s) to pass to arun/arun_many
@@ -789,13 +795,20 @@ async def handle_stream_crawl_request(
     hooks_info = None
     crawler = None
     try:
-        browser_config = BrowserConfig.load(browser_config)
         # browser_config.verbose = True # Set to False or remove for production stress testing
+        browser_config = BrowserConfig.load(
+            _deep_merge(get_browser_config_dict(config), browser_config or {})
+        )
         browser_config.verbose = False
-        crawler_config = CrawlerRunConfig.load(crawler_config)
+        endpoint_overrides = {
+            "scraping_strategy": LXMLWebScrapingStrategy(),
+            "stream": True,
+        }
+        merged_run = _deep_merge(get_run_config_dict(config), endpoint_overrides)
+        crawler_config = CrawlerRunConfig.load(
+            _deep_merge(merged_run, crawler_config or {})
+        )
         _enforce_proxy_safety(browser_config, crawler_config)
-        crawler_config.scraping_strategy = LXMLWebScrapingStrategy()
-        crawler_config.stream = True
 
         # Deep crawl streaming supports exactly one start URL
         if crawler_config.deep_crawl_strategy is not None and len(urls) != 1:
