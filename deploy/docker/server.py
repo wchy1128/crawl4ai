@@ -42,6 +42,7 @@ from schemas import (
 from utils import (
     FilterType, load_config, setup_logging, verify_email_domain,
     validate_webhook_url, validate_url_destination,
+    _deep_merge, get_browser_config_dict, get_run_config_dict,
 )
 import os
 import sys
@@ -119,6 +120,16 @@ def _browser_extra_args() -> list:
     return args
 
 
+def get_default_browser_config_dict() -> dict:
+    """Return the browser config dict from config.yml for use as a base layer."""
+    return get_browser_config_dict(config)
+
+
+def get_default_run_config_dict() -> dict:
+    """Return the run config dict from config.yml for use as a base layer."""
+    return get_run_config_dict(config)
+
+
 def get_default_browser_config() -> BrowserConfig:
     """Get default BrowserConfig from config.yml.
 
@@ -127,10 +138,7 @@ def get_default_browser_config() -> BrowserConfig:
     the default config (/html, /screenshot, /pdf, /execute_js) gets the same
     DNS-rebinding / redirect-to-internal protection as /crawl, rather than
     relying on each handler to remember it."""
-    bc = BrowserConfig(
-        extra_args=_browser_extra_args(),
-        **config["crawler"]["browser"].get("kwargs", {}),
-    )
+    bc = BrowserConfig.load(get_default_browser_config_dict())
     from egress_broker import enforce_egress
     enforce_egress(bc)
     return bc
@@ -192,10 +200,7 @@ async def lifespan(_: FastAPI):
     monitor_module.monitor_stats.start_persistence_worker()
 
     # Initialize browser pool
-    await init_permanent(BrowserConfig(
-        extra_args=_browser_extra_args(),
-        **config["crawler"]["browser"].get("kwargs", {}),
-    ))
+    await init_permanent(get_default_browser_config())
 
     # Start background tasks
     app.state.janitor = asyncio.create_task(janitor())
@@ -613,7 +618,8 @@ async def generate_html(
     Use when you need sanitized HTML structures for building schemas or further processing.
     """
     validate_url_scheme(body.url, allow_raw=True)
-    cfg = CrawlerRunConfig()
+    run_dict = _deep_merge(get_default_run_config_dict(), {})
+    cfg = CrawlerRunConfig.load(run_dict)
     crawler = None
     try:
         crawler = await get_crawler(get_default_browser_config())
@@ -679,7 +685,13 @@ async def generate_screenshot(
     validate_url_scheme(body.url)
     crawler = None
     try:
-        cfg = CrawlerRunConfig(screenshot=True, screenshot_wait_for=body.screenshot_wait_for, wait_for_images=body.wait_for_images)
+        endpoint_overrides = {
+            "screenshot": True,
+            "screenshot_wait_for": body.screenshot_wait_for,
+            "wait_for_images": body.wait_for_images,
+        }
+        run_dict = _deep_merge(get_default_run_config_dict(), endpoint_overrides)
+        cfg = CrawlerRunConfig.load(run_dict)
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
         if not results[0].success:
@@ -714,7 +726,8 @@ async def generate_pdf(
     validate_url_scheme(body.url)
     crawler = None
     try:
-        cfg = CrawlerRunConfig(pdf=True)
+        run_dict = _deep_merge(get_default_run_config_dict(), {"pdf": True})
+        cfg = CrawlerRunConfig.load(run_dict)
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
         if not results[0].success:
@@ -794,7 +807,8 @@ async def execute_js(
         raise HTTPException(400, str(e))
     crawler = None
     try:
-        cfg = CrawlerRunConfig(js_code=body.scripts)
+        run_dict = _deep_merge(get_default_run_config_dict(), {"js_code": body.scripts})
+        cfg = CrawlerRunConfig.load(run_dict)
         crawler = await get_crawler(get_default_browser_config())
         results = await crawler.arun(url=body.url, config=cfg)
         if not results[0].success:
