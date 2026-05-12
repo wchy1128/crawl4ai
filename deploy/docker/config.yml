@@ -72,14 +72,7 @@ security:
 
 # Crawler Configuration
 crawler:
-  run_config:
-    simulate_user: true
-    word_count_threshold: 10
-    only_text: false
-    wait_until: "domcontentloaded"
-    page_timeout: 60000
-    process_iframes: false
-    verbose: false
+  verbose: true
   memory_threshold_percent: 95.0
   rate_limiter:
     enabled: true
@@ -93,7 +86,9 @@ crawler:
   browser:
     kwargs:
       headless: true
-      text_mode: true
+      text_mode: false
+      enable_stealth: true
+      user_agent_mode: "random"
     extra_args:
       # - "--single-process"
       # SECURITY: --no-sandbox disables the Chromium renderer sandbox (a renderer

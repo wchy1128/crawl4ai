@@ -269,6 +269,15 @@ app.mount(
     name="play",
 )
 
+# ── static playground2 (HTML preview) ───────────────────────
+PLAYGROUND2_DIR = pathlib.Path(__file__).parent / "static" / "playground2"
+if PLAYGROUND2_DIR.exists():
+    app.mount(
+        "/playground2",
+        StaticFiles(directory=PLAYGROUND2_DIR, html=True),
+        name="play2",
+    )
+
 # ── static monitor dashboard ────────────────────────────────
 MONITOR_DIR = pathlib.Path(__file__).parent / "static" / "monitor"
 if not MONITOR_DIR.exists():
@@ -898,11 +907,11 @@ async def crawl(
         raise HTTPException(400, "At least one URL required")
     if crawl_request.hooks and not HOOKS_ENABLED:
         raise HTTPException(403, "Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable.")
-    # Check whether it is a redirection for a streaming request
+    # Check whether it is a redirection for a streaming request.
+    # Merge with server defaults (e.g. stream: true from config.yml) before checking.
+    merged_run = _deep_merge(get_default_run_config_dict(), crawl_request.crawler_config or {})
     try:
-        crawler_config = CrawlerRunConfig.load(
-            crawl_request.crawler_config, provenance=Provenance.UNTRUSTED
-        )
+        crawler_config = CrawlerRunConfig.load(merged_run, provenance=Provenance.UNTRUSTED)
     except UntrustedConfigError as e:
         raise HTTPException(400, f"Rejected config: {e}")
     if crawler_config.stream:
@@ -1025,7 +1034,7 @@ def chunk_doc_sections(doc: str) -> List[str]:
 async def get_context(
     request: Request,
     _td: Dict = Depends(token_dep),
-    context_type: str = Query("all", regex="^(code|doc|all)$"),
+    context_type: str = Query("all", pattern="^(code|doc|all)$"),
     query: Optional[str] = Query(
         None, description="Search query to filter results via BM25. WARNING: omitting this returns the entire context and may be very large. Always provide a query when possible."),
     score_ratio: float = Query(

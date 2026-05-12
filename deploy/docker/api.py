@@ -681,10 +681,11 @@ async def handle_crawl_request(
             _deep_merge(get_browser_config_dict(config), browser_config or {}),
             provenance=Provenance.UNTRUSTED,
         )
-        crawler_config = CrawlerRunConfig.load(
-            _deep_merge(get_run_config_dict(config), crawler_config or {}),
-            provenance=Provenance.UNTRUSTED,
-        )
+        # Non-streaming handler: force stream=False so arun_many() returns
+        # List instead of AsyncGenerator, regardless of config.yml or user input.
+        merged_run = _deep_merge(get_run_config_dict(config), crawler_config or {})
+        merged_run["stream"] = False
+        crawler_config = CrawlerRunConfig.load(merged_run, provenance=Provenance.UNTRUSTED)
         from egress_broker import enforce_egress
         enforce_egress(browser_config)
         from governor import clamp_deep_crawl
@@ -707,26 +708,18 @@ async def handle_crawl_request(
             hooks_status = _attach_declarative_hooks(crawler, hooks_config)
             logger.info(f"Hooks attachment status: {hooks_status['status']}")
 
-        base_config = config["crawler"]["base_config"]
-
-        # Build the config(s) to pass to arun/arun_many
+        # Build the config(s) to pass to arun/arun_many.
+        # Single `crawler_config` was already merged with config.yml defaults above
+        # via _deep_merge. For per-URL `crawler_configs` list (PR #1837), apply the
+        # same deep-merge to each entry and force stream=False (non-streaming handler).
         if crawler_configs and len(urls) > 1:
-            # Per-URL config list: deserialize each and apply base_config
-            config_list = [CrawlerRunConfig.load(cc, provenance=Provenance.UNTRUSTED) for cc in crawler_configs]
-            for cfg in config_list:
-                for key, value in base_config.items():
-                    if hasattr(cfg, key):
-                        current_value = getattr(cfg, key)
-                        if current_value is None or current_value == "":
-                            setattr(cfg, key, value)
+            config_list = []
+            for cc in crawler_configs:
+                merged = _deep_merge(get_run_config_dict(config), cc or {})
+                merged["stream"] = False
+                config_list.append(CrawlerRunConfig.load(merged, provenance=Provenance.UNTRUSTED))
             effective_config = config_list
         else:
-            # Single config (original behavior)
-            for key, value in base_config.items():
-                if hasattr(crawler_config, key):
-                    current_value = getattr(crawler_config, key)
-                    if current_value is None or current_value == "":
-                        setattr(crawler_config, key, value)
             effective_config = crawler_config
 
         results = []
