@@ -198,6 +198,15 @@ app.mount(
     name="play",
 )
 
+# ── static playground2 (HTML preview) ───────────────────────
+PLAYGROUND2_DIR = pathlib.Path(__file__).parent / "static" / "playground2"
+if PLAYGROUND2_DIR.exists():
+    app.mount(
+        "/playground2",
+        StaticFiles(directory=PLAYGROUND2_DIR, html=True),
+        name="play2",
+    )
+
 # ── static monitor dashboard ────────────────────────────────
 MONITOR_DIR = pathlib.Path(__file__).parent / "static" / "monitor"
 if not MONITOR_DIR.exists():
@@ -291,18 +300,113 @@ ALLOWED_TYPES = {
 }
 
 
-def _config_from_json(data: dict) -> dict:
-    """Create CrawlerRunConfig or BrowserConfig from JSON {type, params}.
-    No eval() -- uses Pydantic constructors directly."""
-    config_type = data.get("type")
-    params = data.get("params", {})
-    if config_type == "CrawlerRunConfig":
-        obj = CrawlerRunConfig(**params)
-    elif config_type == "BrowserConfig":
-        obj = BrowserConfig(**params)
-    else:
-        raise ValueError("type must be 'CrawlerRunConfig' or 'BrowserConfig'")
-    return obj.dump()
+_SAFE_CONFIG_ALLOWED_NAMES = {
+    # Config constructors
+    "CrawlerRunConfig", "BrowserConfig", "HTTPCrawlerConfig",
+    # Sub-config types
+    "LLMConfig", "ProxyConfig", "GeolocationConfig",
+    "SeedingConfig", "VirtualScrollConfig", "LinkPreviewConfig",
+    # Extraction strategies
+    "JsonCssExtractionStrategy", "JsonXPathExtractionStrategy",
+    "JsonLxmlExtractionStrategy", "LLMExtractionStrategy",
+    "CosineStrategy", "RegexExtractionStrategy",
+    # Markdown / content filters
+    "DefaultMarkdownGenerator",
+    "PruningContentFilter", "BM25ContentFilter", "LLMContentFilter",
+    "LXMLWebScrapingStrategy",
+    # Chunking
+    "RegexChunking",
+    # Deep crawl
+    "BFSDeepCrawlStrategy", "DFSDeepCrawlStrategy", "BestFirstCrawlingStrategy",
+    # Filters & scorers
+    "FilterChain", "URLPatternFilter", "DomainFilter",
+    "ContentTypeFilter", "URLFilter", "SEOFilter", "ContentRelevanceFilter",
+    "KeywordRelevanceScorer", "URLScorer", "CompositeScorer",
+    "DomainAuthorityScorer", "FreshnessScorer", "PathDepthScorer",
+    # Enums
+    "CacheMode", "MatchMode", "DisplayMode",
+    # Dispatchers
+    "MemoryAdaptiveDispatcher", "SemaphoreDispatcher",
+    # Table extraction
+    "DefaultTableExtraction", "NoTableExtraction",
+    # Proxy
+    "RoundRobinProxyStrategy",
+}
+
+# Attributes safe to access in config constructor args (e.g. CacheMode.BYPASS)
+_SAFE_CONFIG_ALLOWED_ATTRS = frozenset({
+    # Enum values commonly used in config
+    "BYPASS", "READ_ONLY", "WRITE_ONLY", "ENABLED", "DISABLED",
+    "READ_WRITE", "BYPASS_CACHE", "STANDARD", "COMPACT", "DETAILED",
+    # Common config field names accessed via dot notation
+    "value", "name",
+})
+
+
+def _safe_eval_config(expr: str) -> dict:
+    """
+    Accept exactly one top-level call to CrawlerRunConfig(...) or BrowserConfig(...).
+    Hardened with allowlists for names, attributes, and blocked AST constructs.
+    """
+    tree = ast.parse(expr, mode="eval")
+
+    # must be a single call
+    if not isinstance(tree.body, ast.Call):
+        raise ValueError("Expression must be a single constructor call")
+
+    call = tree.body
+    if not (isinstance(call.func, ast.Name) and call.func.id in {"CrawlerRunConfig", "BrowserConfig"}):
+        raise ValueError(
+            "Only CrawlerRunConfig(...) or BrowserConfig(...) are allowed")
+
+    for node in ast.walk(call):
+        # Block nested function calls
+        if isinstance(node, ast.Call) and node is not call:
+            raise ValueError("Nested function calls are not permitted")
+
+        # Block lambdas
+        if isinstance(node, ast.Lambda):
+            raise ValueError("Lambda expressions are not permitted")
+
+        # Block generators and comprehensions
+        if isinstance(node, (ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp)):
+            raise ValueError("Comprehensions and generators are not permitted")
+
+        # Allowlist attribute access
+        if isinstance(node, ast.Attribute):
+            if node.attr not in _SAFE_CONFIG_ALLOWED_ATTRS:
+                raise ValueError(
+                    f"Attribute access '{node.attr}' is not permitted in config expressions")
+
+        # Allowlist name references
+        if isinstance(node, ast.Name) and node.id not in _SAFE_CONFIG_ALLOWED_NAMES:
+            # Allow Python literals/constants used as keyword arg values
+            if node.id not in {"True", "False", "None"}:
+                raise ValueError(
+                    f"Name '{node.id}' is not permitted in config expressions")
+
+    # Only expose allowlisted names from crawl4ai
+    safe_env = {}
+    for name in _SAFE_CONFIG_ALLOWED_NAMES:
+        obj = getattr(_c4, name, None)
+        if obj is not None:
+            safe_env[name] = obj
+    safe_env["True"] = True
+    safe_env["False"] = False
+    safe_env["None"] = None
+
+    obj = eval(compile(tree, "<config>", "eval"),
+               {"__builtins__": {}}, safe_env)
+
+    # Extract only the keyword args the user actually wrote in the editor.
+    # This preserves user intent even when the value equals the class default
+    # (e.g. stream=False), which obj.dump() would silently drop.
+    from crawl4ai.async_configs import to_serializable_dict
+    user_keys = [kw.arg for kw in call.keywords if kw.arg]
+    flat = {}
+    for k in user_keys:
+        flat[k] = to_serializable_dict(getattr(obj, k))
+    return flat
 
 
 # ── job router ──────────────────────────────────────────────
@@ -682,8 +786,9 @@ async def crawl(
     if crawl_request.hooks and not HOOKS_ENABLED:
         raise HTTPException(403, "Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable.")
     # Check whether it is a redirection for a streaming request
-    crawler_config = CrawlerRunConfig.load(crawl_request.crawler_config)
-    if crawler_config.stream:
+    # Merge with server defaults (e.g. stream: true from config.yml) before checking
+    merged_run = _deep_merge(get_default_run_config_dict(), crawl_request.crawler_config or {})
+    if merged_run.get("stream", False):
         return await stream_process(crawl_request=crawl_request)
     
     # Prepare hooks config if provided
@@ -803,7 +908,7 @@ def chunk_doc_sections(doc: str) -> List[str]:
 async def get_context(
     request: Request,
     _td: Dict = Depends(token_dep),
-    context_type: str = Query("all", regex="^(code|doc|all)$"),
+    context_type: str = Query("all", pattern="^(code|doc|all)$"),
     query: Optional[str] = Query(
         None, description="search query to filter chunks"),
     score_ratio: float = Query(
