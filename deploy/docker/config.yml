@@ -111,6 +111,18 @@ crawler:
       # --allow-insecure-localhost / --ignore-certificate-errors removed: they
       # disabled TLS verification for every crawl (MITM / SSRF-to-internal-TLS).
       # Set CRAWL4AI_ALLOW_INSECURE_TLS=true only for trusted internal testing.
+  run_config:
+    stream: false
+    simulate_user: true
+    word_count_threshold: 10
+    only_text: false
+    wait_until: "load"
+    page_timeout: 60000
+    process_iframes: false
+    magic: true
+    remove_overlay_elements: true
+    delay_before_return_html: 1.0
+    override_navigator: true
 
 # Logging Configuration
 logging:
