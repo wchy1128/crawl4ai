@@ -31,6 +31,7 @@ When you self-host, you can scale from a single container to a full browser infr
   - [Option 1: Using Pre-built Docker Hub Images (Recommended)](#option-1-using-pre-built-docker-hub-images-recommended)
   - [Option 2: Using Docker Compose](#option-2-using-docker-compose)
   - [Option 3: Manual Local Build & Run](#option-3-manual-local-build--run)
+  - [Option 4: Custom Image from Your Fork](#option-4-custom-image-from-your-fork)
 - [MCP (Model Context Protocol) Support](#mcp-model-context-protocol-support)
   - [What is MCP?](#what-is-mcp)
   - [Connecting via MCP](#connecting-via-mcp)
@@ -48,6 +49,7 @@ When you self-host, you can scale from a single container to a full browser infr
 - [Complete Examples](#complete-examples)
 - [Server Configuration](#server-configuration)
   - [Understanding config.yml](#understanding-configyml)
+  - [Configuration Override Strategy](#configuration-override-strategy)
   - [JWT Authentication](#jwt-authentication)
   - [Configuration Tips and Best Practices](#configuration-tips-and-best-practices)
   - [Customizing Your Configuration](#customizing-your-configuration)
@@ -315,6 +317,33 @@ docker buildx build \
 docker stop crawl4ai-standalone && docker rm crawl4ai-standalone
 ```
 
+### Option 4: Custom Image from Your Fork
+
+If you have a forked repository with custom modifications, you can build a Docker image that layers your code on top of the official Crawl4AI image — no local files needed, everything comes from GitHub.
+
+The repository includes a ready-made script at `deploy/docker/build-custom-image.sh`:
+
+```bash
+# Default: builds from the fork configured in the script
+bash deploy/docker/build-custom-image.sh
+
+# Override defaults with environment variables:
+GITHUB_REPO=https://github.com/yourname/crawl4ai.git \
+GITHUB_BRANCH=my-feature \
+TAG=my-crawl4ai:v1 \
+bash deploy/docker/build-custom-image.sh
+```
+
+How it works:
+1. Pulls the official base image (`unclecode/crawl4ai:latest`)
+2. Clones your fork from GitHub inside the build
+3. Reinstalls the library and replaces all server-side code under `/app/`
+4. Produces a new image you can run identically to the official one
+
+```bash
+docker run --rm -p 11235:11235 my-crawl4ai:v1
+```
+
 ---
 
 ## MCP (Model Context Protocol) Support
@@ -356,7 +385,32 @@ When connected via MCP, the following tools are available:
 - `pdf` - Generate PDF documents
 - `execute_js` - Run JavaScript on web pages
 - `crawl` - Perform multi-URL crawling
-- `ask` - Query the Crawl4AI library context
+- `ask` - Query the Crawl4AI library context using BM25 search
+
+All MCP tools that accept `browser_config` and `crawler_config` parameters will merge them with the server defaults from `config.yml` (see [Configuration Override Strategy](#configuration-override-strategy)).
+
+#### The `ask` Tool
+
+The `ask` tool queries two pre-generated knowledge base files (source code context and documentation context) using BM25 text search. It helps AI assistants retrieve relevant Crawl4AI code snippets and documentation without needing the full source.
+
+Parameters:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `context_type` | string | `"all"` | Which context to search: `"code"`, `"doc"`, or `"all"` |
+| `query` | string | — | BM25 search query. **Always provide this** — omitting it returns the entire knowledge base which can be very large. |
+| `score_ratio` | float | `0.5` | Minimum score as a fraction of the maximum score (0.0–1.0). Lower values return more results. |
+| `max_results` | int | `20` | Maximum number of chunks to return. |
+
+Example query:
+```json
+{
+  "context_type": "doc",
+  "query": "how to configure proxy rotation",
+  "score_ratio": 0.3,
+  "max_results": 10
+}
+```
 
 ### Testing MCP Connections
 
@@ -1642,6 +1696,16 @@ A built-in web playground is available at `http://localhost:11235/playground` fo
 
 This is the easiest way to translate Python configuration to JSON requests when building integrations.
 
+### Result Preview (Playground2)
+
+A second web interface is available at `http://localhost:11235/playground2` for previewing crawl results. Unlike the main playground which focuses on configuration and request generation, Playground2 provides:
+
+1. A simple input form to submit a URL with browser and crawler configuration
+2. Real-time display of crawled results including raw HTML, cleaned HTML, and generated Markdown
+3. Visual inspection of extracted content side-by-side
+
+This is useful for quickly verifying that your configuration produces the expected output before integrating into your application.
+
 ### Python SDK
 
 Install the SDK: `pip install crawl4ai`
@@ -2449,32 +2513,34 @@ Here's a detailed breakdown of the configuration options (using defaults from `d
 # Application Configuration
 app:
   title: "Crawl4AI API"
-  version: "1.0.0" # Consider setting this to match library version, e.g., "0.5.1"
-  host: "0.0.0.0"
-  port: 8020 # NOTE: This port is used ONLY when running server.py directly. Gunicorn overrides this (see supervisord.conf).
-  reload: False # Default set to False - suitable for production
+  version: "1.0.0"
+  host: "127.0.0.1"
+  port: 11235
+  reload: False
+  workers: 1
   timeout_keep_alive: 300
 
 # Default LLM Configuration
 llm:
-  provider: "openai/gpt-4o-mini"  # Can be overridden by LLM_PROVIDER env var
+  provider: "openai/gpt-4o-mini"
   # api_key: sk-...  # If you pass the API key directly (not recommended)
-  # temperature and base_url are controlled via environment variables or request parameters
 
-# Redis Configuration (Used by internal Redis server managed by supervisord)
+# Redis Configuration
+# Set task_ttl_seconds to automatically expire task data in Redis.
 redis:
   host: "localhost"
   port: 6379
   db: 0
   password: ""
-  # ... other redis options ...
+  task_ttl_seconds: 3600  # TTL for task data (1 hour default)
+  ssl: False
 
 # Rate Limiting Configuration
 rate_limiting:
   enabled: True
   default_limit: "1000/minute"
   trusted_proxies: []
-  storage_uri: "memory://"  # Use "redis://localhost:6379" if you need persistent/shared limits
+  storage_uri: "memory://"  # Use "redis://localhost:6379" for production
 
 # Security Configuration
 # NOTE (0.9.0): the defaults below reflect 0.8.x. In 0.9.0 the Docker server is
@@ -2483,11 +2549,12 @@ rate_limiting:
 # boundary. See the migration guide for the 0.9.0 defaults and config keys:
 # https://github.com/unclecode/crawl4ai/blob/main/deploy/docker/MIGRATION.md
 security:
-  enabled: false # Master toggle for security features
-  jwt_enabled: false # Enable JWT authentication (requires security.enabled=true)
-  https_redirect: false # Force HTTPS (requires security.enabled=true)
-  trusted_hosts: ["*"] # Allowed hosts (use specific domains in production)
-  headers: # Security headers (applied if security.enabled=true)
+  enabled: false
+  jwt_enabled: false
+  api_token: ""  # When set, /token endpoint requires this secret to issue JWTs
+  https_redirect: false
+  trusted_hosts: ["*"]
+  headers:
     x_content_type_options: "nosniff"
     x_frame_options: "DENY"
     content_security_policy: "default-src 'self'"
@@ -2495,12 +2562,30 @@ security:
 
 # Crawler Configuration
 crawler:
+  verbose: true  # Global verbose toggle, overrides BrowserConfig.verbose and CrawlerRunConfig.verbose
   memory_threshold_percent: 95.0
   rate_limiter:
-    base_delay: [1.0, 2.0] # Min/max delay between requests in seconds for dispatcher
+    enabled: true
+    base_delay: [1.0, 2.0]
   timeouts:
-    stream_init: 30.0  # Timeout for stream initialization
-    batch_process: 300.0 # Timeout for non-streaming /crawl processing
+    stream_init: 30.0
+    batch_process: 300.0
+  pool:
+    max_pages: 40          # Global semaphore: max concurrent pages
+    idle_ttl_sec: 300      # Janitor idle cutoff in seconds
+  browser:
+    kwargs:
+      headless: true
+    extra_args:
+      - "--no-sandbox"
+      - "--disable-dev-shm-usage"
+      - "--disable-gpu"
+      - "--disable-software-rasterizer"
+      - "--disable-web-security"
+      - "--allow-insecure-localhost"
+      - "--ignore-certificate-errors"
+  run_config:
+    stream: false
 
 # Logging Configuration
 logging:
@@ -2514,11 +2599,46 @@ observability:
     endpoint: "/metrics"
   health_check:
     endpoint: "/health"
+
+# Webhook Configuration
+webhooks:
+  enabled: true
+  default_url: null
+  data_in_payload: false
+  retry:
+    max_attempts: 5
+    initial_delay_ms: 1000
+    max_delay_ms: 32000
+    timeout_ms: 30000
+  headers:
+    User-Agent: "Crawl4AI-Webhook/1.0"
 ```
 
 *(JWT Authentication section remains the same, just note the default port is now 11235 for requests)*
 
-*(Configuration Tips and Best Practices remain the same)*
+### Configuration Override Strategy
+
+The server uses a **three-layer configuration override** for each API request. Understanding this helps you predict how `config.yml`, endpoint logic, and user input interact.
+
+**Layer 1 — Server defaults (`config.yml`)**
+
+The `crawler.browser` and `crawler.run_config` sections serve as the base configuration for every request:
+- `crawler.browser.kwargs` + `crawler.browser.extra_args` → merged into `BrowserConfig`
+- `crawler.run_config` → merged into `CrawlerRunConfig`
+- `crawler.verbose` → overrides both `BrowserConfig.verbose` and `CrawlerRunConfig.verbose`
+
+**Layer 2 — Endpoint forced overrides**
+
+Each API endpoint may force certain parameters regardless of user input:
+- `/crawl` forces `stream=False` (non-streaming handler returns a list)
+- `/crawl/stream` forces `stream=True` and `scraping_strategy=LXMLWebScrapingStrategy()`
+- `/md`, `/html`, `/screenshot`, `/pdf`, `/execute_js` each apply endpoint-specific overrides
+
+**Layer 3 — User request parameters**
+
+The `browser_config` and `crawler_config` fields in the API request are merged on top of the above layers. User values always take precedence over server defaults, but **not** over endpoint-forced overrides.
+
+The merge is performed by `_deep_merge(base, override)` — a recursive dictionary merge where the `override` wins on conflicts. This means you only need to specify the parameters you want to change; everything else inherits from `config.yml`.
 
 ### Customizing Your Configuration
 

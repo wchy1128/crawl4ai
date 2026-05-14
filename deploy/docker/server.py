@@ -591,7 +591,7 @@ async def get_markdown(
             400, "Invalid URL format. Must start with http://, https://, or for raw HTML (raw:, raw://)")
     # base_url is intentionally not accepted from the request (key-exfil vector);
     # the LLM endpoint is server-derived from the provider name only.
-    markdown = await handle_markdown_request(
+    result = await handle_markdown_request(
         body.url, body.f, body.q, body.c, config, body.provider,
         body.temperature
     )
@@ -600,7 +600,8 @@ async def get_markdown(
         "filter": body.f,
         "query": body.q,
         "cache": body.c,
-        "markdown": markdown,
+        "markdown": result["markdown"],
+        "metadata": result["metadata"],
         "success": True
     })
 
@@ -616,6 +617,7 @@ async def generate_html(
     """
     Crawls the URL, preprocesses the raw HTML for schema extraction, and returns the processed HTML.
     Use when you need sanitized HTML structures for building schemas or further processing.
+    The URL must start with http://, https://, raw:, or raw:// (for raw HTML input).
     """
     validate_url_scheme(body.url, allow_raw=True)
     run_dict = _deep_merge(get_default_run_config_dict(), {})
@@ -1025,20 +1027,22 @@ async def get_context(
     _td: Dict = Depends(token_dep),
     context_type: str = Query("all", regex="^(code|doc|all)$"),
     query: Optional[str] = Query(
-        None, description="search query to filter chunks"),
+        None, description="Search query to filter results via BM25. WARNING: omitting this returns the entire context and may be very large. Always provide a query when possible."),
     score_ratio: float = Query(
         0.5, ge=0.0, le=1.0, description="min score as fraction of max_score"),
     max_results: int = Query(
         20, ge=1, description="absolute cap on returned chunks"),
 ):
     """
-    This end point is design for any questions about Crawl4ai library. It returns a plain text markdown with extensive information about Crawl4ai. 
-    You can use this as a context for any AI assistant. Use this endpoint for AI assistants to retrieve library context for decision making or code generation tasks.
-    Alway is BEST practice you provide a query to filter the context. Otherwise the lenght of the response will be very long.
+    Query Crawl4AI library context (code + docs) using BM25 search.
+    Use this to retrieve relevant code snippets or documentation for AI-assisted tasks.
+
+    IMPORTANT: Always provide a 'query' to filter results. Without a query the full
+    unfiltered context is returned, which can be very large.
 
     Parameters:
     - context_type: Specify "code" for code context, "doc" for documentation context, or "all" for both.
-    - query: RECOMMENDED search query to filter paragraphs using BM25. You can leave this empty to get all the context.
+    - query: BM25 search query to filter results. Strongly recommended — omitting this returns the entire context which can be very large.
     - score_ratio: Minimum score as a fraction of the maximum score for filtering results.
     - max_results: Maximum number of results to return. Default is 20.
 
