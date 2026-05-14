@@ -802,6 +802,13 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                                 params={"url": url},
                             )
                             response = None
+                        elif 'net::ERR_CONNECTION_CLOSED' in err_str:
+                            self.logger.warning(
+                                message="Connection closed by server (possible anti-bot): {url}",
+                                tag="ANTIBOT",
+                                params={"url": url},
+                            )
+                            response = None
                         else:
                             raise RuntimeError(f"Failed on navigating ACS-GOTO:\n{err_str}")
 
