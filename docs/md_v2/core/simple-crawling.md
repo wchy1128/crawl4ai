@@ -91,15 +91,17 @@ if not result.success:
 
 ## Logging and Debugging
 
-Enable verbose logging in `BrowserConfig`:
+Enable verbose logging in `BrowserConfig` (off by default):
 
 ```python
 browser_config = BrowserConfig(verbose=True)
 
 async with AsyncWebCrawler(config=browser_config) as crawler:
-    run_config = CrawlerRunConfig()
+    run_config = CrawlerRunConfig(verbose=True)
     result = await crawler.arun(url="https://example.com", config=run_config)
 ```
+
+> **Note**: Both `BrowserConfig.verbose` and `CrawlerRunConfig.verbose` default to `False`. In Docker deployments, you can set `crawler.verbose: true` in `config.yml` to enable verbose output globally for both configs.
 
 ## Complete Example
 

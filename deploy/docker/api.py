@@ -330,9 +330,13 @@ async def handle_markdown_request(
                 detail=result.error_message
             )
 
-        return (result.markdown.raw_markdown
+        markdown_content = (result.markdown.raw_markdown
                if filter_type == FilterType.RAW
                else result.markdown.fit_markdown)
+        return {
+            "markdown": markdown_content,
+            "metadata": result.metadata or {},
+        }
 
     except Exception as e:
         logger.error(f"Markdown error: {str(e)}", exc_info=True)
