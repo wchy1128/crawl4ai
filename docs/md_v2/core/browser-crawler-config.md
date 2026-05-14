@@ -25,7 +25,7 @@ class BrowserConfig:
         proxy_config=None,
         viewport_width=1080,
         viewport_height=600,
-        verbose=True,
+        verbose=False,
         use_persistent_context=False,
         user_data_dir=None,
         cookies=None,
@@ -93,9 +93,9 @@ class BrowserConfig:
    - Set to `2.0` for Retina-quality screenshots (e.g., a 1920×1080 viewport produces 3840×2160 images).
    - Higher values increase screenshot size and rendering time proportionally.
 
-9.⠀**`verbose`**  
-   - If `True`, prints extra logs.  
-   - Handy for debugging.
+9.⠀**`verbose`**
+   - If `True`, prints extra logs. Defaults to `False`.
+   - In Docker deployments, set `crawler.verbose` in `config.yml` to enable globally for both `BrowserConfig` and `CrawlerRunConfig`.
 
 9.⠀**`use_persistent_context`**  
    - If `True`, uses a **persistent** browser profile, storing cookies/local storage across runs.  
@@ -306,9 +306,9 @@ class CrawlerRunConfig:
     - Use `match_mode` (OR/AND) to control how multiple patterns combine.
     - See [URL-Specific Configurations](../api/arun_many.md#url-specific-configurations) for examples.
 
-13.⠀**`verbose`**:  
-    - Logs additional runtime details.  
-    - Overlaps with the browser's verbosity if also set to `True` in `BrowserConfig`.
+13.⠀**`verbose`**:
+    - Logs additional runtime details. Defaults to `False`.
+    - In Docker deployments, set `crawler.verbose` in `config.yml` to enable globally.
 
 14.⠀**`stream`**:  
     - If `True`, enables streaming mode for `arun_many()` to process URLs as they complete.
