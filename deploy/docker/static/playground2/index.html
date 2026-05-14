@@ -840,7 +840,7 @@
                     const time = Math.round(performance.now() - startTime);
                     if (!response.ok) {
                         updateStatus('error', time);
-                        throw new Error(responseData.error || 'Request failed');
+                        throw new Error(responseData.detail || responseData.error || 'Request failed');
                     }
                     updateStatus('success', time);
                     document.querySelector('#response-content code').textContent = JSON.stringify(responseData, null, 2);
@@ -909,7 +909,7 @@
 
                     if (!response.ok) {
                         updateStatus('error', time);
-                        throw new Error(responseData.error || 'Request failed');
+                        throw new Error(responseData.detail || responseData.error || 'Request failed');
                     }
 
                     updateStatus(

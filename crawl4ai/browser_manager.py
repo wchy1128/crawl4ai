@@ -1383,6 +1383,18 @@ class BrowserManager:
             for pattern in ad_tracker_patterns:
                 await context.route(pattern, lambda route: route.abort())
 
+        # TODO: Strip infrastructure-injected headers that leak datacenter origin
+        # (e.g. X-Amzn-Trace-Id from AWS ALB, X-Forwarded-For from proxies).
+        # These headers tell Cloudflare the request comes from a datacenter.
+        # Uncomment when confirmed that stripping helps bypass anti-bot:
+        #
+        # _leaky_headers = {"x-amzn-trace-id", "x-forwarded-for", "x-envoy-external-address"}
+        # async def _strip_leaky_headers(route):
+        #     headers = {k: v for k, v in route.request.headers.items()
+        #                if k.lower() not in _leaky_headers}
+        #     await route.continue_(headers=headers)
+        # await context.route("**/*", _strip_leaky_headers)
+
         return context
 
     def _make_config_signature(self, crawlerRunConfig: CrawlerRunConfig) -> str:
