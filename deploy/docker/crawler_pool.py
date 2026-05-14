@@ -3,11 +3,13 @@ import asyncio, json, hashlib, time
 from contextlib import suppress
 from typing import Dict, Optional
 from crawl4ai import AsyncWebCrawler, BrowserConfig
+from crawl4ai.browser_adapter import UndetectedAdapter
 from utils import load_config, get_container_memory_percent
 import logging
 
 logger = logging.getLogger(__name__)
 CONFIG = load_config()
+USE_UNDETECTED = CONFIG.get("crawler", {}).get("browser", {}).get("use_undetected", False)
 
 # Pool tiers
 PERMANENT: Optional[AsyncWebCrawler] = None  # Always-ready default browser
@@ -110,7 +112,8 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
 
         # Create new in cold pool
         logger.info(f"🆕 Creating new browser in cold pool (sig={sig[:8]}, mem={mem_pct:.1f}%)")
-        crawler = AsyncWebCrawler(config=cfg, thread_safe=False)
+        adapter = UndetectedAdapter() if USE_UNDETECTED else None
+        crawler = AsyncWebCrawler(config=cfg, thread_safe=False, browser_adapter=adapter) if adapter else AsyncWebCrawler(config=cfg, thread_safe=False)
         await crawler.start()
         crawler.active_requests = 1
         COLD_POOL[sig] = crawler
@@ -137,7 +140,8 @@ async def init_permanent(cfg: BrowserConfig):
             return
         DEFAULT_CONFIG_SIG = _sig(cfg)
         logger.info("🔥 Creating permanent default browser")
-        PERMANENT = AsyncWebCrawler(config=cfg, thread_safe=False)
+        adapter = UndetectedAdapter() if USE_UNDETECTED else None
+        PERMANENT = AsyncWebCrawler(config=cfg, thread_safe=False, browser_adapter=adapter) if adapter else AsyncWebCrawler(config=cfg, thread_safe=False)
         await PERMANENT.start()
         LAST_USED[DEFAULT_CONFIG_SIG] = time.time()
         USAGE_COUNT[DEFAULT_CONFIG_SIG] = 0

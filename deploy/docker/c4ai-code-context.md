@@ -1,11 +1,18 @@
 # Crawl4AI Code Context
 
-Generated on 2025-04-21
+Generated on 2026-05-15
+
 
 ## File: crawl4ai/async_configs.py
 
+
 ```py
+import copy
+import functools
+import importlib
 import os
+import warnings
+import requests
 from .config import (
     DEFAULT_PROVIDER,
     DEFAULT_PROVIDER_API_KEY,
@@ -24,22 +31,141 @@ from .extraction_strategy import ExtractionStrategy, LLMExtractionStrategy
 from .chunking_strategy import ChunkingStrategy, RegexChunking
 
 from .markdown_generation_strategy import MarkdownGenerationStrategy, DefaultMarkdownGenerator
-from .content_scraping_strategy import ContentScrapingStrategy, WebScrapingStrategy
+from .content_scraping_strategy import ContentScrapingStrategy, LXMLWebScrapingStrategy
 from .deep_crawling import DeepCrawlStrategy
+from .table_extraction import TableExtractionStrategy, DefaultTableExtraction
 
 from .cache_context import CacheMode
 from .proxy_strategy import ProxyRotationStrategy
 
-from typing import Union, List
 import inspect
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 from enum import Enum
+
+# Type alias for URL matching
+UrlMatcher = Union[str, Callable[[str], bool], List[Union[str, Callable[[str], bool]]]]
+
+
+def _with_defaults(cls):
+    """Class decorator: adds set_defaults/get_defaults/reset_defaults classmethods.
+
+    After decorating, every new instance resolves parameters as:
+        explicit arg  >  class-level user defaults  >  hardcoded default
+
+    Usage::
+
+        BrowserConfig.set_defaults(headless=False, viewport_width=1920)
+        cfg = BrowserConfig()          # headless=False, viewport_width=1920
+        cfg = BrowserConfig(headless=True)  # explicit wins → headless=True
+    """
+    original_init = cls.__init__
+    sig = inspect.signature(original_init)
+    param_names = [p for p in sig.parameters if p != "self"]
+    valid_params = frozenset(param_names)
+
+    @functools.wraps(original_init)
+    def wrapped_init(self, *args, **kwargs):
+        user_defaults = type(self)._user_defaults
+        if user_defaults:
+            # Determine which params the caller passed explicitly
+            explicit = set(kwargs.keys())
+            for i in range(len(args)):
+                if i < len(param_names):
+                    explicit.add(param_names[i])
+            # Inject user defaults for non-explicit params
+            for key, value in user_defaults.items():
+                if key not in explicit:
+                    kwargs[key] = copy.deepcopy(value)
+        original_init(self, *args, **kwargs)
+
+    cls.__init__ = wrapped_init
+    cls._user_defaults = {}
+
+    @classmethod
+    def set_defaults(klass, **kwargs):
+        """Set class-level default overrides for new instances.
+
+        Args:
+            **kwargs: Parameter names and their default values.
+
+        Raises:
+            ValueError: If any key is not a valid ``__init__`` parameter.
+        """
+        invalid = set(kwargs) - valid_params
+        if invalid:
+            raise ValueError(
+                f"Invalid parameter(s) for {klass.__name__}: {invalid}"
+            )
+        for k, v in kwargs.items():
+            klass._user_defaults[k] = copy.deepcopy(v)
+
+    @classmethod
+    def get_defaults(klass):
+        """Return a deep copy of the current class-level defaults."""
+        return copy.deepcopy(klass._user_defaults)
+
+    @classmethod
+    def reset_defaults(klass, *names):
+        """Clear class-level defaults.
+
+        With no arguments, removes all overrides.
+        With arguments, removes only the named overrides.
+        """
+        if names:
+            for n in names:
+                klass._user_defaults.pop(n, None)
+        else:
+            klass._user_defaults.clear()
+
+    cls.set_defaults = set_defaults
+    cls.get_defaults = get_defaults
+    cls.reset_defaults = reset_defaults
+    return cls
+
+
+class MatchMode(Enum):
+    OR = "or"
+    AND = "and"
 
 # from .proxy_strategy import ProxyConfig
 
+# Allowlist of types that can be deserialized via from_serializable_dict().
+# This prevents arbitrary class instantiation from untrusted input (e.g. API requests).
+ALLOWED_DESERIALIZE_TYPES = {
+    # Config classes
+    "BrowserConfig", "CrawlerRunConfig", "HTTPCrawlerConfig",
+    "LLMConfig", "ProxyConfig", "GeolocationConfig",
+    "SeedingConfig", "VirtualScrollConfig", "LinkPreviewConfig",
+    # Extraction strategies
+    "JsonCssExtractionStrategy", "JsonXPathExtractionStrategy",
+    "JsonLxmlExtractionStrategy", "LLMExtractionStrategy",
+    "CosineStrategy", "RegexExtractionStrategy",
+    # Markdown / content
+    "DefaultMarkdownGenerator",
+    "PruningContentFilter", "BM25ContentFilter", "LLMContentFilter",
+    # Scraping
+    "LXMLWebScrapingStrategy", "PDFContentScrapingStrategy",
+    # Chunking
+    "RegexChunking",
+    # Deep crawl
+    "BFSDeepCrawlStrategy", "DFSDeepCrawlStrategy", "BestFirstCrawlingStrategy",
+    # Filters & scorers
+    "FilterChain", "URLPatternFilter", "DomainFilter",
+    "ContentTypeFilter", "URLFilter", "SEOFilter", "ContentRelevanceFilter",
+    "KeywordRelevanceScorer", "URLScorer", "CompositeScorer",
+    "DomainAuthorityScorer", "FreshnessScorer", "PathDepthScorer",
+    # Enums
+    "CacheMode", "MatchMode", "DisplayMode",
+    # Dispatchers
+    "MemoryAdaptiveDispatcher", "SemaphoreDispatcher",
+    # Table extraction
+    "DefaultTableExtraction", "NoTableExtraction",
+    # Proxy
+    "RoundRobinProxyStrategy",
+}
 
 
-def to_serializable_dict(obj: Any, ignore_default_value : bool = False) -> Dict:
+def to_serializable_dict(obj: Any, ignore_default_value : bool = False):
     """
     Recursively convert an object to a serializable dictionary using {type, params} structure
     for complex objects.
@@ -78,6 +204,12 @@ def to_serializable_dict(obj: Any, ignore_default_value : bool = False) -> Dict:
 
     # Handle class instances
     if hasattr(obj, "__class__"):
+        # Skip types that cannot be deserialized (e.g. logging.Logger, callables).
+        # Only serialize objects whose type is in ALLOWED_DESERIALIZE_TYPES so that
+        # from_serializable_dict can reconstruct them on the other side.
+        if _type not in ALLOWED_DESERIALIZE_TYPES:
+            return None
+
         # Get constructor signature
         sig = inspect.signature(obj.__class__.__init__)
         params = sig.parameters
@@ -95,16 +227,17 @@ def to_serializable_dict(obj: Any, ignore_default_value : bool = False) -> Dict:
                 if value != param.default and not ignore_default_value:
                     current_values[name] = to_serializable_dict(value)
         
-        if hasattr(obj, '__slots__'):
-            for slot in obj.__slots__:
-                if slot.startswith('_'):  # Handle private slots
-                    attr_name = slot[1:]  # Remove leading '_'
-                    value = getattr(obj, slot, None)
-                    if value is not None:
-                        current_values[attr_name] = to_serializable_dict(value)
+        # Don't serialize private __slots__ - they're internal implementation details
+        # not constructor parameters. This was causing URLPatternFilter to fail
+        # because _simple_suffixes was being serialized as 'simple_suffixes'
+        # if hasattr(obj, '__slots__'):
+        #     for slot in obj.__slots__:
+        #         if slot.startswith('_'):  # Handle private slots
+        #             attr_name = slot[1:]  # Remove leading '_'
+        #             value = getattr(obj, slot, None)
+        #             if value is not None:
+        #                 current_values[attr_name] = to_serializable_dict(value)
 
-            
-        
         return {
             "type": obj.__class__.__name__,
             "params": current_values
@@ -124,18 +257,41 @@ def from_serializable_dict(data: Any) -> Any:
     if isinstance(data, (str, int, float, bool)):
         return data
 
-    # Handle typed data
-    if isinstance(data, dict) and "type" in data:
+    # Handle typed data.
+    # Only enter the typed-object path for dicts that match the shapes produced
+    # by to_serializable_dict(): {"type": "<ClassName>", "params": {...}} or
+    # {"type": "dict", "value": {...}}.  Plain business dicts that happen to
+    # carry a "type" key (e.g. JSON-Schema fragments, JsonCss field specs like
+    # {"type": "text", "name": "..."}) have neither "params" nor "value" and
+    # must fall through to the raw-dict path below so they are passed as data.
+    if (
+        isinstance(data, dict)
+        and "type" in data
+        and ("params" in data or (data["type"] == "dict" and "value" in data))
+    ):
         # Handle plain dictionaries
         if data["type"] == "dict" and "value" in data:
             return {k: from_serializable_dict(v) for k, v in data["value"].items()}
 
-        # Import from crawl4ai for class instances
-        import crawl4ai
+        # Security: only allow known-safe types to be deserialized.
+        # Unknown types (e.g. logging.Logger serialized by older clients) are
+        # silently dropped (returned as None) instead of crashing the request.
+        type_name = data["type"]
+        if type_name not in ALLOWED_DESERIALIZE_TYPES:
+            return None
 
-        if hasattr(crawl4ai, data["type"]):
-            cls = getattr(crawl4ai, data["type"])
+        cls = None
+        module_paths = ["crawl4ai"]
+        for module_path in module_paths:
+            try:
+                mod = importlib.import_module(module_path)
+                if hasattr(mod, type_name):
+                    cls = getattr(mod, type_name)
+                    break
+            except (ImportError, AttributeError):
+                continue
 
+        if cls is not None:
             # Handle Enum
             if issubclass(cls, Enum):
                 return cls(data["params"])
@@ -166,7 +322,57 @@ def is_empty_value(value: Any) -> bool:
         return True
     return False
 
+class GeolocationConfig:
+    def __init__(
+        self,
+        latitude: float,
+        longitude: float,
+        accuracy: Optional[float] = 0.0
+    ):
+        """Configuration class for geolocation settings.
+        
+        Args:
+            latitude: Latitude coordinate (e.g., 37.7749)
+            longitude: Longitude coordinate (e.g., -122.4194)
+            accuracy: Accuracy in meters. Default: 0.0
+        """
+        self.latitude = latitude
+        self.longitude = longitude
+        self.accuracy = accuracy
+    
+    @staticmethod
+    def from_dict(geo_dict: Dict) -> "GeolocationConfig":
+        """Create a GeolocationConfig from a dictionary."""
+        return GeolocationConfig(
+            latitude=geo_dict.get("latitude"),
+            longitude=geo_dict.get("longitude"),
+            accuracy=geo_dict.get("accuracy", 0.0)
+        )
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary representation."""
+        return {
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "accuracy": self.accuracy
+        }
+    
+    def clone(self, **kwargs) -> "GeolocationConfig":
+        """Create a copy of this configuration with updated values.
+
+        Args:
+            **kwargs: Key-value pairs of configuration options to update
+
+        Returns:
+            GeolocationConfig: A new instance with the specified updates
+        """
+        config_dict = self.to_dict()
+        config_dict.update(kwargs)
+        return GeolocationConfig.from_dict(config_dict)
+
 class ProxyConfig:
+    DIRECT = "direct"  # Sentinel: use in proxy_config list to mean "no proxy"
+
     def __init__(
         self,
         server: str,
@@ -175,7 +381,7 @@ class ProxyConfig:
         ip: Optional[str] = None,
     ):
         """Configuration class for a single proxy.
-        
+
         Args:
             server: Proxy server URL (e.g., "http://127.0.0.1:8080")
             username: Optional username for proxy authentication
@@ -185,7 +391,7 @@ class ProxyConfig:
         self.server = server
         self.username = username
         self.password = password
-        
+
         # Extract IP from server if not explicitly provided
         self.ip = ip or self._extract_ip_from_server()
     
@@ -204,24 +410,39 @@ class ProxyConfig:
     
     @staticmethod
     def from_string(proxy_str: str) -> "ProxyConfig":
-        """Create a ProxyConfig from a string in the format 'ip:port:username:password'."""
-        parts = proxy_str.split(":")
-        if len(parts) == 4:  # ip:port:username:password
+        """Create a ProxyConfig from a string.
+
+        Supported formats:
+        - 'http://username:password@ip:port'
+        - 'http://ip:port'
+        - 'socks5://ip:port'
+        - 'ip:port:username:password'
+        - 'ip:port'
+        """
+        s = (proxy_str or "").strip()
+        # URL with credentials
+        if "@" in s and "://" in s:
+            auth_part, server_part = s.split("@", 1)
+            protocol, credentials = auth_part.split("://", 1)
+            if ":" in credentials:
+                username, password = credentials.split(":", 1)
+                return ProxyConfig(
+                    server=f"{protocol}://{server_part}",
+                    username=username,
+                    password=password,
+                )
+        # URL without credentials (keep scheme)
+        if "://" in s and "@" not in s:
+            return ProxyConfig(server=s)
+        # Colon separated forms
+        parts = s.split(":")
+        if len(parts) == 4:
             ip, port, username, password = parts
-            return ProxyConfig(
-                server=f"http://{ip}:{port}",
-                username=username,
-                password=password,
-                ip=ip
-            )
-        elif len(parts) == 2:  # ip:port only
+            return ProxyConfig(server=f"http://{ip}:{port}", username=username, password=password)
+        if len(parts) == 2:
             ip, port = parts
-            return ProxyConfig(
-                server=f"http://{ip}:{port}",
-                ip=ip
-            )
-        else:
-            raise ValueError(f"Invalid proxy string format: {proxy_str}")
+            return ProxyConfig(server=f"http://{ip}:{port}")
+        raise ValueError(f"Invalid proxy string format: {proxy_str}")
     
     @staticmethod
     def from_dict(proxy_dict: Dict) -> "ProxyConfig":
@@ -230,7 +451,7 @@ class ProxyConfig:
             server=proxy_dict.get("server"),
             username=proxy_dict.get("username"),
             password=proxy_dict.get("password"),
-            ip=proxy_dict.get("ip")
+            ip=proxy_dict.get("ip"),
         )
     
     @staticmethod
@@ -260,7 +481,7 @@ class ProxyConfig:
             "server": self.server,
             "username": self.username,
             "password": self.password,
-            "ip": self.ip
+            "ip": self.ip,
         }
     
     def clone(self, **kwargs) -> "ProxyConfig":
@@ -276,8 +497,7 @@ class ProxyConfig:
         config_dict.update(kwargs)
         return ProxyConfig.from_dict(config_dict)
 
-
-
+@_with_defaults
 class BrowserConfig:
     """
     Configuration class for setting up a browser instance and its context in AsyncPlaywrightCrawlerStrategy.
@@ -300,6 +520,29 @@ class BrowserConfig:
         use_managed_browser (bool): Launch the browser using a managed approach (e.g., via CDP), allowing
                                     advanced manipulation. Default: False.
         cdp_url (str): URL for the Chrome DevTools Protocol (CDP) endpoint. Default: "ws://localhost:9222/devtools/browser/".
+        browser_context_id (str or None): Pre-existing CDP browser context ID to use. When provided along with
+                                          cdp_url, the crawler will reuse this context instead of creating a new one.
+                                          Useful for cloud browser services that pre-create isolated contexts.
+                                          Default: None.
+        target_id (str or None): Pre-existing CDP target ID (page) to use. When provided along with
+                                 browser_context_id, the crawler will reuse this target instead of creating
+                                 a new page. Default: None.
+        cdp_cleanup_on_close (bool): When True and using cdp_url, the close() method will still clean up
+                                     the local Playwright client resources. Useful for cloud/server scenarios
+                                     where you don't own the remote browser but need to prevent memory leaks
+                                     from accumulated Playwright instances. Default: False.
+        cdp_close_delay (float): Seconds to wait after disconnecting a CDP WebSocket before stopping the
+                                 Playwright subprocess. Gives the connection time to fully release. Set to
+                                 0 to skip the delay entirely. Only applies when cdp_cleanup_on_close=True.
+                                 Default: 1.0.
+        cache_cdp_connection (bool): When True and using cdp_url, the Playwright subprocess and CDP WebSocket
+                                     are cached at the class level and shared across multiple BrowserManager
+                                     instances connecting to the same cdp_url. Reference-counted; the connection
+                                     is only closed when the last user releases it. Eliminates the overhead of
+                                     repeated Playwright/CDP setup and teardown. Default: False.
+        create_isolated_context (bool): When True and using cdp_url, forces creation of a new browser context
+                                        instead of reusing the default context. Essential for concurrent crawls
+                                        on the same browser to prevent navigation conflicts. Default: False.
         debugging_port (int): Port for the browser debugging protocol. Default: 9222.
         use_persistent_context (bool): Use a persistent browser context (like a persistent profile).
                                        Automatically sets use_managed_browser=True. Default: False.
@@ -317,6 +560,13 @@ class BrowserConfig:
         viewport_height (int): Default viewport height for pages. Default: 600.
         viewport (dict): Default viewport dimensions for pages. If set, overrides viewport_width and viewport_height.
                          Default: None.
+        device_scale_factor (float): The device pixel ratio used for rendering pages. Controls how many
+                                     physical pixels map to one CSS pixel, allowing simulation of HiDPI
+                                     or Retina displays. For example, a viewport of 1920x1080 with a
+                                     device_scale_factor of 2.0 produces screenshots at 3840x2160 resolution.
+                                     Increasing this value improves screenshot quality but may increase
+                                     memory usage and rendering time.
+                                     Default: 1.0.
         verbose (bool): Enable verbose logging.
                         Default: True.
         accept_downloads (bool): Whether to allow file downloads. If True, requires a downloads_path.
@@ -343,6 +593,21 @@ class BrowserConfig:
         light_mode (bool): Disables certain background features for performance gains. Default: False.
         extra_args (list): Additional command-line arguments passed to the browser.
                            Default: [].
+        enable_stealth (bool): If True, applies playwright-stealth to bypass basic bot detection.
+                              Cannot be used with use_undetected browser mode. Default: False.
+        memory_saving_mode (bool): If True, adds aggressive cache discard and V8 heap cap flags
+                                   to reduce Chromium memory growth. Recommended for high-volume
+                                   crawling (1000+ pages). May slightly reduce performance due to
+                                   cache eviction. Default: False.
+        max_pages_before_recycle (int): Number of pages to crawl before recycling the browser
+                                        process to reclaim leaked memory. 0 = disabled.
+                                        Recommended: 500-1000 for long-running crawlers.
+                                        Default: 0.
+        avoid_ads (bool): If True, blocks ad-related and tracker network requests at the
+                          browser context level using a curated blocklist of top ad/tracker
+                          domains. Default: False.
+        avoid_css (bool): If True, blocks loading of CSS files (css, less, scss, sass) to
+                          reduce resource usage and speed up crawling. Default: False.
     """
 
     def __init__(
@@ -352,6 +617,12 @@ class BrowserConfig:
         browser_mode: str = "dedicated",
         use_managed_browser: bool = False,
         cdp_url: str = None,
+        browser_context_id: str = None,
+        target_id: str = None,
+        cdp_cleanup_on_close: bool = False,
+        cdp_close_delay: float = 1.0,
+        cache_cdp_connection: bool = False,
+        create_isolated_context: bool = False,
         use_persistent_context: bool = False,
         user_data_dir: str = None,
         chrome_channel: str = "chromium",
@@ -361,13 +632,14 @@ class BrowserConfig:
         viewport_width: int = 1080,
         viewport_height: int = 600,
         viewport: dict = None,
+        device_scale_factor: float = 1.0,
         accept_downloads: bool = False,
         downloads_path: str = None,
         storage_state: Union[str, dict, None] = None,
         ignore_https_errors: bool = True,
         java_script_enabled: bool = True,
         sleep_on_close: bool = False,
-        verbose: bool = True,
+        verbose: bool = False,
         cookies: list = None,
         headers: dict = None,
         user_agent: str = (
@@ -383,12 +655,25 @@ class BrowserConfig:
         extra_args: list = None,
         debugging_port: int = 9222,
         host: str = "localhost",
+        enable_stealth: bool = False,
+        avoid_ads: bool = False,
+        avoid_css: bool = False,
+        init_scripts: List[str] = None,
+        memory_saving_mode: bool = False,
+        max_pages_before_recycle: int = 0,
     ):
+        
         self.browser_type = browser_type
-        self.headless = headless or True
+        self.headless = headless
         self.browser_mode = browser_mode
         self.use_managed_browser = use_managed_browser
         self.cdp_url = cdp_url
+        self.browser_context_id = browser_context_id
+        self.target_id = target_id
+        self.cdp_cleanup_on_close = cdp_cleanup_on_close
+        self.cdp_close_delay = cdp_close_delay
+        self.cache_cdp_connection = cache_cdp_connection
+        self.create_isolated_context = create_isolated_context
         self.use_persistent_context = use_persistent_context
         self.user_data_dir = user_data_dir
         self.chrome_channel = chrome_channel or self.browser_type or "chromium"
@@ -396,9 +681,22 @@ class BrowserConfig:
         if self.browser_type in ["firefox", "webkit"]:
             self.channel = ""
             self.chrome_channel = ""
+        if proxy:
+            warnings.warn("The 'proxy' parameter is deprecated and will be removed in a future release. Use 'proxy_config' instead.", UserWarning)
         self.proxy = proxy
         self.proxy_config = proxy_config
-
+        if isinstance(self.proxy_config, dict):
+            self.proxy_config = ProxyConfig.from_dict(self.proxy_config)
+        if isinstance(self.proxy_config, str):
+            self.proxy_config = ProxyConfig.from_string(self.proxy_config)
+        
+        if self.proxy and self.proxy_config:
+            warnings.warn("Both 'proxy' and 'proxy_config' are provided. 'proxy_config' will take precedence.", UserWarning)
+            self.proxy = None
+        elif self.proxy:
+            # Convert proxy string to ProxyConfig if proxy_config is not provided
+            self.proxy_config = ProxyConfig.from_string(self.proxy)
+            self.proxy = None
 
         self.viewport_width = viewport_width
         self.viewport_height = viewport_height
@@ -406,6 +704,7 @@ class BrowserConfig:
         if self.viewport is not None:
             self.viewport_width = self.viewport.get("width", 1080)
             self.viewport_height = self.viewport.get("height", 600)
+        self.device_scale_factor = device_scale_factor
         self.accept_downloads = accept_downloads
         self.downloads_path = downloads_path
         self.storage_state = storage_state
@@ -423,6 +722,12 @@ class BrowserConfig:
         self.verbose = verbose
         self.debugging_port = debugging_port
         self.host = host
+        self.enable_stealth = enable_stealth
+        self.avoid_ads = avoid_ads
+        self.avoid_css = avoid_css
+        self.init_scripts = init_scripts if init_scripts is not None else []
+        self.memory_saving_mode = memory_saving_mode
+        self.max_pages_before_recycle = max_pages_before_recycle
 
         fa_user_agenr_generator = ValidUAGenerator()
         if self.user_agent_mode == "random":
@@ -454,43 +759,26 @@ class BrowserConfig:
         # If persistent context is requested, ensure managed browser is enabled
         if self.use_persistent_context:
             self.use_managed_browser = True
+            
+        # Validate stealth configuration
+        if self.enable_stealth and self.use_managed_browser and self.browser_mode == "builtin":
+            raise ValueError(
+                "enable_stealth cannot be used with browser_mode='builtin'. "
+                "Stealth mode requires a dedicated browser instance."
+            )
 
     @staticmethod
     def from_kwargs(kwargs: dict) -> "BrowserConfig":
-        return BrowserConfig(
-            browser_type=kwargs.get("browser_type", "chromium"),
-            headless=kwargs.get("headless", True),
-            browser_mode=kwargs.get("browser_mode", "dedicated"),
-            use_managed_browser=kwargs.get("use_managed_browser", False),
-            cdp_url=kwargs.get("cdp_url"),
-            use_persistent_context=kwargs.get("use_persistent_context", False),
-            user_data_dir=kwargs.get("user_data_dir"),
-            chrome_channel=kwargs.get("chrome_channel", "chromium"),
-            channel=kwargs.get("channel", "chromium"),
-            proxy=kwargs.get("proxy"),
-            proxy_config=kwargs.get("proxy_config", None),
-            viewport_width=kwargs.get("viewport_width", 1080),
-            viewport_height=kwargs.get("viewport_height", 600),
-            accept_downloads=kwargs.get("accept_downloads", False),
-            downloads_path=kwargs.get("downloads_path"),
-            storage_state=kwargs.get("storage_state"),
-            ignore_https_errors=kwargs.get("ignore_https_errors", True),
-            java_script_enabled=kwargs.get("java_script_enabled", True),
-            cookies=kwargs.get("cookies", []),
-            headers=kwargs.get("headers", {}),
-            user_agent=kwargs.get(
-                "user_agent",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36",
-            ),
-            user_agent_mode=kwargs.get("user_agent_mode"),
-            user_agent_generator_config=kwargs.get("user_agent_generator_config"),
-            text_mode=kwargs.get("text_mode", False),
-            light_mode=kwargs.get("light_mode", False),
-            extra_args=kwargs.get("extra_args", []),
-            debugging_port=kwargs.get("debugging_port", 9222),
-            host=kwargs.get("host", "localhost"),
-        )
+        # Auto-deserialize any dict values that use the {"type": ..., "params": ...}
+        # serialization format (e.g. from JSON API requests or dump()/load() roundtrips).
+        kwargs = {
+            k: from_serializable_dict(v) if isinstance(v, dict) and "type" in v else v
+            for k, v in kwargs.items()
+        }
+        # Only pass keys present in kwargs so that __init__ defaults (and
+        # set_defaults() overrides) are respected for missing keys.
+        valid = inspect.signature(BrowserConfig.__init__).parameters.keys() - {"self"}
+        return BrowserConfig(**{k: v for k, v in kwargs.items() if k in valid})
 
     def to_dict(self):
         result = {
@@ -499,14 +787,19 @@ class BrowserConfig:
             "browser_mode": self.browser_mode,
             "use_managed_browser": self.use_managed_browser,
             "cdp_url": self.cdp_url,
+            "browser_context_id": self.browser_context_id,
+            "target_id": self.target_id,
+            "cdp_cleanup_on_close": self.cdp_cleanup_on_close,
+            "create_isolated_context": self.create_isolated_context,
             "use_persistent_context": self.use_persistent_context,
             "user_data_dir": self.user_data_dir,
             "chrome_channel": self.chrome_channel,
             "channel": self.channel,
             "proxy": self.proxy,
-            "proxy_config": self.proxy_config,
+            "proxy_config": self.proxy_config.to_dict() if hasattr(self.proxy_config, 'to_dict') else self.proxy_config,
             "viewport_width": self.viewport_width,
             "viewport_height": self.viewport_height,
+            "device_scale_factor": self.device_scale_factor,
             "accept_downloads": self.accept_downloads,
             "downloads_path": self.downloads_path,
             "storage_state": self.storage_state,
@@ -524,9 +817,15 @@ class BrowserConfig:
             "verbose": self.verbose,
             "debugging_port": self.debugging_port,
             "host": self.host,
+            "enable_stealth": self.enable_stealth,
+            "avoid_ads": self.avoid_ads,
+            "avoid_css": self.avoid_css,
+            "init_scripts": self.init_scripts,
+            "memory_saving_mode": self.memory_saving_mode,
+            "max_pages_before_recycle": self.max_pages_before_recycle,
         }
 
-                
+
         return result
 
     def clone(self, **kwargs):
@@ -555,6 +854,224 @@ class BrowserConfig:
             return config
         return BrowserConfig.from_kwargs(config)
 
+    def set_nstproxy(
+        self,
+        token: str,
+        channel_id: str,
+        country: str = "ANY",
+        state: str = "",
+        city: str = "",
+        protocol: str = "http",
+        session_duration: int = 10,
+    ):
+        """
+        Fetch a proxy from NSTProxy API and automatically assign it to proxy_config.
+
+        Get your NSTProxy token from: https://app.nstproxy.com/profile
+
+        Args:
+            token (str): NSTProxy API token.
+            channel_id (str): NSTProxy channel ID.
+            country (str, optional): Country code (default: "ANY").
+            state (str, optional): State code (default: "").
+            city (str, optional): City name (default: "").
+            protocol (str, optional): Proxy protocol ("http" or "socks5"). Defaults to "http".
+            session_duration (int, optional): Session duration in minutes (0 = rotate each request). Defaults to 10.
+
+        Raises:
+            ValueError: If the API response format is invalid.
+            PermissionError: If the API returns an error message.
+        """
+
+        # --- Validate input early ---
+        if not token or not channel_id:
+            raise ValueError("[NSTProxy] token and channel_id are required")
+
+        if protocol not in ("http", "socks5"):
+            raise ValueError(f"[NSTProxy] Invalid protocol: {protocol}")
+
+        # --- Build NSTProxy API URL ---
+        params = {
+            "fType": 2,
+            "count": 1,
+            "channelId": channel_id,
+            "country": country,
+            "protocol": protocol,
+            "sessionDuration": session_duration,
+            "token": token,
+        }
+        if state:
+            params["state"] = state
+        if city:
+            params["city"] = city
+
+        url = "https://api.nstproxy.com/api/v1/generate/apiproxies"
+
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+
+            data = response.json()
+
+            # --- Handle API error response ---
+            if isinstance(data, dict) and data.get("err"):
+                raise PermissionError(f"[NSTProxy] API Error: {data.get('msg', 'Unknown error')}")
+
+            if not isinstance(data, list) or not data:
+                raise ValueError("[NSTProxy] Invalid API response — expected a non-empty list")
+
+            proxy_info = data[0]
+
+            # --- Apply proxy config ---
+            self.proxy_config = ProxyConfig(
+                server=f"{protocol}://{proxy_info['ip']}:{proxy_info['port']}",
+                username=proxy_info["username"],
+                password=proxy_info["password"],
+            )
+
+        except Exception as e:
+            print(f"[NSTProxy] ❌ Failed to set proxy: {e}")
+            raise
+
+class VirtualScrollConfig:
+    """Configuration for virtual scroll handling.
+    
+    This config enables capturing content from pages with virtualized scrolling
+    (like Twitter, Instagram feeds) where DOM elements are recycled as user scrolls.
+    """
+    
+    def __init__(
+        self,
+        container_selector: str,
+        scroll_count: int = 10,
+        scroll_by: Union[str, int] = "container_height",
+        wait_after_scroll: float = 0.5,
+    ):
+        """
+        Initialize virtual scroll configuration.
+        
+        Args:
+            container_selector: CSS selector for the scrollable container
+            scroll_count: Maximum number of scrolls to perform
+            scroll_by: Amount to scroll - can be:
+                - "container_height": scroll by container's height
+                - "page_height": scroll by viewport height  
+                - int: fixed pixel amount
+            wait_after_scroll: Seconds to wait after each scroll for content to load
+        """
+        self.container_selector = container_selector
+        self.scroll_count = scroll_count
+        self.scroll_by = scroll_by
+        self.wait_after_scroll = wait_after_scroll
+    
+    def to_dict(self) -> dict:
+        """Convert to dictionary for serialization."""
+        return {
+            "container_selector": self.container_selector,
+            "scroll_count": self.scroll_count,
+            "scroll_by": self.scroll_by,
+            "wait_after_scroll": self.wait_after_scroll,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> "VirtualScrollConfig":
+        """Create instance from dictionary."""
+        return cls(**data)
+
+class LinkPreviewConfig:
+    """Configuration for link head extraction and scoring."""
+    
+    def __init__(
+        self,
+        include_internal: bool = True,
+        include_external: bool = False,
+        include_patterns: Optional[List[str]] = None,
+        exclude_patterns: Optional[List[str]] = None,
+        concurrency: int = 10,
+        timeout: int = 5,
+        max_links: int = 100,
+        query: Optional[str] = None,
+        score_threshold: Optional[float] = None,
+        verbose: bool = False
+    ):
+        """
+        Initialize link extraction configuration.
+        
+        Args:
+            include_internal: Whether to include same-domain links
+            include_external: Whether to include different-domain links  
+            include_patterns: List of glob patterns to include (e.g., ["*/docs/*", "*/api/*"])
+            exclude_patterns: List of glob patterns to exclude (e.g., ["*/login*", "*/admin*"])
+            concurrency: Number of links to process simultaneously
+            timeout: Timeout in seconds for each link's head extraction
+            max_links: Maximum number of links to process (prevents overload)
+            query: Query string for BM25 contextual scoring (optional)
+            score_threshold: Minimum relevance score to include links (0.0-1.0, optional)
+            verbose: Show detailed progress during extraction
+        """
+        self.include_internal = include_internal
+        self.include_external = include_external
+        self.include_patterns = include_patterns
+        self.exclude_patterns = exclude_patterns
+        self.concurrency = concurrency
+        self.timeout = timeout
+        self.max_links = max_links
+        self.query = query
+        self.score_threshold = score_threshold
+        self.verbose = verbose
+        
+        # Validation
+        if concurrency <= 0:
+            raise ValueError("concurrency must be positive")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if max_links <= 0:
+            raise ValueError("max_links must be positive")
+        if score_threshold is not None and not (0.0 <= score_threshold <= 1.0):
+            raise ValueError("score_threshold must be between 0.0 and 1.0")
+        if not include_internal and not include_external:
+            raise ValueError("At least one of include_internal or include_external must be True")
+    
+    @staticmethod
+    def from_dict(config_dict: Dict[str, Any]) -> "LinkPreviewConfig":
+        """Create LinkPreviewConfig from dictionary (for backward compatibility)."""
+        if not config_dict:
+            return None
+        
+        return LinkPreviewConfig(
+            include_internal=config_dict.get("include_internal", True),
+            include_external=config_dict.get("include_external", False),
+            include_patterns=config_dict.get("include_patterns"),
+            exclude_patterns=config_dict.get("exclude_patterns"),
+            concurrency=config_dict.get("concurrency", 10),
+            timeout=config_dict.get("timeout", 5),
+            max_links=config_dict.get("max_links", 100),
+            query=config_dict.get("query"),
+            score_threshold=config_dict.get("score_threshold"),
+            verbose=config_dict.get("verbose", False)
+        )
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary format."""
+        return {
+            "include_internal": self.include_internal,
+            "include_external": self.include_external,
+            "include_patterns": self.include_patterns,
+            "exclude_patterns": self.exclude_patterns,
+            "concurrency": self.concurrency,
+            "timeout": self.timeout,
+            "max_links": self.max_links,
+            "query": self.query,
+            "score_threshold": self.score_threshold,
+            "verbose": self.verbose
+        }
+    
+    def clone(self, **kwargs) -> "LinkPreviewConfig":
+        """Create a copy with updated values."""
+        config_dict = self.to_dict()
+        config_dict.update(kwargs)
+        return LinkPreviewConfig.from_dict(config_dict)
+
 
 class HTTPCrawlerConfig:
     """HTTP-specific crawler configuration"""
@@ -565,6 +1082,7 @@ class HTTPCrawlerConfig:
     json: Optional[Dict[str, Any]] = None
     follow_redirects: bool = True
     verify_ssl: bool = True
+    downloads_path: Optional[str] = None
 
     def __init__(
         self,
@@ -574,6 +1092,7 @@ class HTTPCrawlerConfig:
         json: Optional[Dict[str, Any]] = None,
         follow_redirects: bool = True,
         verify_ssl: bool = True,
+        downloads_path: Optional[str] = None,
     ):
         self.method = method
         self.headers = headers
@@ -581,6 +1100,7 @@ class HTTPCrawlerConfig:
         self.json = json
         self.follow_redirects = follow_redirects
         self.verify_ssl = verify_ssl
+        self.downloads_path = downloads_path
 
     @staticmethod
     def from_kwargs(kwargs: dict) -> "HTTPCrawlerConfig":
@@ -591,6 +1111,7 @@ class HTTPCrawlerConfig:
             json=kwargs.get("json"),
             follow_redirects=kwargs.get("follow_redirects", True),
             verify_ssl=kwargs.get("verify_ssl", True),
+            downloads_path=kwargs.get("downloads_path"),
         )
 
     def to_dict(self):
@@ -601,6 +1122,7 @@ class HTTPCrawlerConfig:
             "json": self.json,
             "follow_redirects": self.follow_redirects,
             "verify_ssl": self.verify_ssl,
+            "downloads_path": self.downloads_path,
         }
 
     def clone(self, **kwargs):
@@ -626,13 +1148,8 @@ class HTTPCrawlerConfig:
             return config
         return HTTPCrawlerConfig.from_kwargs(config)
 
+@_with_defaults
 class CrawlerRunConfig():
-    _UNWANTED_PROPS = {
-        'disable_cache' : 'Instead, use cache_mode=CacheMode.DISABLED',
-        'bypass_cache' : 'Instead, use cache_mode=CacheMode.BYPASS',
-        'no_cache_read' : 'Instead, use cache_mode=CacheMode.WRITE_ONLY',
-        'no_cache_write' : 'Instead, use cache_mode=CacheMode.READ_ONLY',
-    }
 
     """
     Configuration class for controlling how the crawler runs each crawl operation.
@@ -683,9 +1200,29 @@ class CrawlerRunConfig():
         parser_type (str): Type of parser to use for HTML parsing.
                            Default: "lxml".
         scraping_strategy (ContentScrapingStrategy): Scraping strategy to use.
-                           Default: WebScrapingStrategy.
+                           Default: LXMLWebScrapingStrategy.
         proxy_config (ProxyConfig or dict or None): Detailed proxy configuration, e.g. {"server": "...", "username": "..."}.
                                      If None, no additional proxy config. Default: None.
+
+        # Sticky Proxy Session Parameters
+        proxy_session_id (str or None): When set, maintains the same proxy for all requests sharing this session ID.
+                                        The proxy is acquired on first request and reused for subsequent requests.
+                                        Session expires when explicitly released or crawler context is closed.
+                                        Default: None.
+        proxy_session_ttl (int or None): Time-to-live for sticky session in seconds.
+                                         After TTL expires, a new proxy is acquired on next request.
+                                         Default: None (session lasts until explicitly released or crawler closes).
+        proxy_session_auto_release (bool): If True, automatically release the proxy session after a batch operation.
+                                           Useful for arun_many() to clean up sessions automatically.
+                                           Default: False.
+
+        # Browser Location and Identity Parameters
+        locale (str or None): Locale to use for the browser context (e.g., "en-US").
+                             Default: None.
+        timezone_id (str or None): Timezone identifier to use for the browser context (e.g., "America/New_York").
+                                  Default: None.
+        geolocation (GeolocationConfig or None): Geolocation configuration for the browser.
+                                                Default: None.
 
         # SSL Parameters
         fetch_ssl_certificate: bool = False,
@@ -707,6 +1244,15 @@ class CrawlerRunConfig():
         shared_data (dict or None): Shared data to be passed between hooks.
                                      Default: None.
 
+        # Cache Validation Parameters (Smart Cache)
+        check_cache_freshness (bool): If True, validates cached content freshness using HTTP
+                                      conditional requests (ETag/Last-Modified) and head fingerprinting
+                                      before returning cached results. Avoids full browser crawls when
+                                      content hasn't changed. Only applies when cache_mode allows reads.
+                                      Default: False.
+        cache_validation_timeout (float): Timeout in seconds for cache validation HTTP requests.
+                                          Default: 10.0.
+
         # Page Navigation and Timing Parameters
         wait_until (str): The condition to wait for when navigating, e.g. "domcontentloaded".
                           Default: "domcontentloaded".
@@ -714,6 +1260,9 @@ class CrawlerRunConfig():
                             Default: 60000 (60 seconds).
         wait_for (str or None): A CSS selector or JS condition to wait for before extracting content.
                                 Default: None.
+        wait_for_timeout (int or None): Specific timeout in ms for the wait_for condition.
+                                       If None, uses page_timeout instead.
+                                       Default: None.
         wait_for_images (bool): If True, wait for images to load before extracting content.
                                 Default: False.
         delay_before_return_html (float): Delay in seconds before retrieving final HTML.
@@ -726,7 +1275,11 @@ class CrawlerRunConfig():
                                Default: 5.
 
         # Page Interaction Parameters
-        js_code (str or list of str or None): JavaScript code/snippets to run on the page.
+        js_code (str or list of str or None): JavaScript code/snippets to run on the page
+                                              after wait_for and delay_before_return_html.
+                                              Default: None.
+        js_code_before_wait (str or list of str or None): JavaScript to run BEFORE wait_for.
+                                              Use for triggering loading that wait_for then checks.
                                               Default: None.
         js_only (bool): If True, indicates subsequent calls are JS-driven updates, not full page loads.
                         Default: False.
@@ -736,10 +1289,20 @@ class CrawlerRunConfig():
                                Default: False.
         scroll_delay (float): Delay in seconds between scroll steps if scan_full_page is True.
                               Default: 0.2.
+        max_scroll_steps (Optional[int]): Maximum number of scroll steps to perform during full page scan.
+                                         If None, scrolls until the entire page is loaded. Default: None.
         process_iframes (bool): If True, attempts to process and inline iframe content.
                                 Default: False.
+        flatten_shadow_dom (bool): If True, flatten shadow DOM content into the light DOM
+                                    before HTML capture so page.content() includes it.
+                                    Also injects an init script to force-open closed shadow roots.
+                                    Default: False.
         remove_overlay_elements (bool): If True, remove overlays/popups before extracting HTML.
                                         Default: False.
+        remove_consent_popups (bool): If True, remove GDPR/cookie consent popups (IAB TCF/CMP)
+                                      before extracting HTML. Targets known CMP providers like
+                                      OneTrust, Cookiebot, TrustArc, Quantcast, Didomi, etc.
+                                      Default: False.
         simulate_user (bool): If True, simulate user interactions (mouse moves, clicks) for anti-bot measures.
                               Default: False.
         override_navigator (bool): If True, overrides navigator properties for more human-like behavior.
@@ -756,6 +1319,9 @@ class CrawlerRunConfig():
                                              Default: None.
         screenshot_height_threshold (int): Threshold for page height to decide screenshot strategy.
                                            Default: SCREENSHOT_HEIGHT_TRESHOLD (from config, e.g. 20000).
+        force_viewport_screenshot (bool): If True, always take viewport-only screenshots regardless of page height.
+                                          When False, uses automatic decision (viewport for short pages, full-page for long pages).
+                                          Default: False.
         pdf (bool): Whether to generate a PDF of the page.
                     Default: False.
         image_description_min_word_threshold (int): Minimum words for image description extraction.
@@ -766,6 +1332,14 @@ class CrawlerRunConfig():
                                          Default: False.
         table_score_threshold (int): Minimum score threshold for processing a table.
                                      Default: 7.
+        table_extraction (TableExtractionStrategy): Strategy to use for table extraction.
+                                     Default: DefaultTableExtraction with table_score_threshold.
+
+        # Virtual Scroll Parameters
+        virtual_scroll_config (VirtualScrollConfig or dict or None): Configuration for handling virtual scroll containers.
+                                                                     Used for capturing content from pages with virtualized 
+                                                                     scrolling (e.g., Twitter, Instagram feeds).
+                                                                     Default: None.
 
         # Link and Domain Handling Parameters
         exclude_social_media_domains (list of str): List of domains to exclude for social media links.
@@ -780,6 +1354,9 @@ class CrawlerRunConfig():
                                        Default: [].
         exclude_internal_links (bool): If True, exclude internal links from the results.
                                        Default: False.
+        score_links (bool): If True, calculate intrinsic quality scores for all links using URL structure,
+                           text quality, and contextual relevance metrics. Separate from link_preview_config.
+                           Default: False.
 
         # Debugging and Logging Parameters
         verbose (bool): Enable verbose logging.
@@ -797,6 +1374,12 @@ class CrawlerRunConfig():
         # Connection Parameters
         stream (bool): If True, enables streaming of crawled URLs as they are processed when used with arun_many.
                       Default: False.
+        process_in_browser (bool): If True, forces raw:/file:// URLs to be processed through the browser
+                                   pipeline (enabling js_code, wait_for, scrolling, etc.). When False (default),
+                                   raw:/file:// URLs use a fast path that returns HTML directly without browser
+                                   interaction. This is automatically enabled when browser-requiring parameters
+                                   are detected (js_code, wait_for, screenshot, pdf, etc.).
+                                   Default: False.
 
         check_robots_txt (bool): Whether to check robots.txt rules before crawling. Default: False
                                  Default: False.
@@ -815,6 +1398,12 @@ class CrawlerRunConfig():
 
         url: str = None  # This is not a compulsory parameter
     """
+    _UNWANTED_PROPS = {
+        'disable_cache' : 'Instead, use cache_mode=CacheMode.DISABLED',
+        'bypass_cache' : 'Instead, use cache_mode=CacheMode.BYPASS',
+        'no_cache_read' : 'Instead, use cache_mode=CacheMode.WRITE_ONLY',
+        'no_cache_write' : 'Instead, use cache_mode=CacheMode.READ_ONLY',
+    }
 
     def __init__(
         self,
@@ -834,8 +1423,16 @@ class CrawlerRunConfig():
         prettiify: bool = False,
         parser_type: str = "lxml",
         scraping_strategy: ContentScrapingStrategy = None,
-        proxy_config: Union[ProxyConfig, dict, None] = None,
+        proxy_config: Union["ProxyConfig", List["ProxyConfig"], dict, str, None] = None,
         proxy_rotation_strategy: Optional[ProxyRotationStrategy] = None,
+        # Sticky Proxy Session Parameters
+        proxy_session_id: Optional[str] = None,
+        proxy_session_ttl: Optional[int] = None,
+        proxy_session_auto_release: bool = False,
+        # Browser Location and Identity Parameters
+        locale: Optional[str] = None,
+        timezone_id: Optional[str] = None,
+        geolocation: Optional[GeolocationConfig] = None,
         # SSL Parameters
         fetch_ssl_certificate: bool = False,
         # Caching Parameters
@@ -846,10 +1443,14 @@ class CrawlerRunConfig():
         no_cache_read: bool = False,
         no_cache_write: bool = False,
         shared_data: dict = None,
+        # Cache Validation Parameters (Smart Cache)
+        check_cache_freshness: bool = False,
+        cache_validation_timeout: float = 10.0,
         # Page Navigation and Timing Parameters
         wait_until: str = "domcontentloaded",
         page_timeout: int = PAGE_TIMEOUT,
         wait_for: str = None,
+        wait_for_timeout: int = None,
         wait_for_images: bool = False,
         delay_before_return_html: float = 0.1,
         mean_delay: float = 0.1,
@@ -857,12 +1458,17 @@ class CrawlerRunConfig():
         semaphore_count: int = 5,
         # Page Interaction Parameters
         js_code: Union[str, List[str]] = None,
+        js_code_before_wait: Union[str, List[str]] = None,
+        c4a_script: Union[str, List[str]] = None,
         js_only: bool = False,
         ignore_body_visibility: bool = True,
         scan_full_page: bool = False,
         scroll_delay: float = 0.2,
+        max_scroll_steps: Optional[int] = None,
         process_iframes: bool = False,
+        flatten_shadow_dom: bool = False,
         remove_overlay_elements: bool = False,
+        remove_consent_popups: bool = False,
         simulate_user: bool = False,
         override_navigator: bool = False,
         magic: bool = False,
@@ -871,11 +1477,13 @@ class CrawlerRunConfig():
         screenshot: bool = False,
         screenshot_wait_for: float = None,
         screenshot_height_threshold: int = SCREENSHOT_HEIGHT_TRESHOLD,
+        force_viewport_screenshot: bool = False,
         pdf: bool = False,
         capture_mhtml: bool = False,
         image_description_min_word_threshold: int = IMAGE_DESCRIPTION_MIN_WORD_THRESHOLD,
         image_score_threshold: int = IMAGE_SCORE_THRESHOLD,
         table_score_threshold: int = 7,
+        table_extraction: TableExtractionStrategy = None,
         exclude_external_images: bool = False,
         exclude_all_images: bool = False,
         # Link and Domain Handling Parameters
@@ -884,8 +1492,10 @@ class CrawlerRunConfig():
         exclude_social_media_links: bool = False,
         exclude_domains: list = None,
         exclude_internal_links: bool = False,
+        score_links: bool = False,
+        preserve_https_for_internal_links: bool = False,
         # Debugging and Logging Parameters
-        verbose: bool = True,
+        verbose: bool = False,
         log_console: bool = False,
         # Network and Console Capturing Parameters
         capture_network_requests: bool = False,
@@ -893,18 +1503,32 @@ class CrawlerRunConfig():
         # Connection Parameters
         method: str = "GET",
         stream: bool = False,
+        prefetch: bool = False,  # When True, return only HTML + links (skip heavy processing)
+        process_in_browser: bool = False,  # Force browser processing for raw:/file:// URLs
         url: str = None,
+        base_url: str = None,  # Base URL for markdown link resolution (used with raw: HTML)
         check_robots_txt: bool = False,
         user_agent: str = None,
         user_agent_mode: str = None,
         user_agent_generator_config: dict = {},
         # Deep Crawl Parameters
         deep_crawl_strategy: Optional[DeepCrawlStrategy] = None,
+        # Link Extraction Parameters
+        link_preview_config: Union[LinkPreviewConfig, Dict[str, Any]] = None,
+        # Virtual Scroll Parameters
+        virtual_scroll_config: Union[VirtualScrollConfig, Dict[str, Any]] = None,
+        # URL Matching Parameters
+        url_matcher: Optional[UrlMatcher] = None,
+        match_mode: MatchMode = MatchMode.OR,
         # Experimental Parameters
         experimental: Dict[str, Any] = None,
+        # Anti-Bot Retry Parameters
+        max_retries: int = 0,
+        fallback_fetch_function: Optional[Callable[[str], Awaitable[str]]] = None,
     ):
         # TODO: Planning to set properties dynamically based on the __init__ signature
         self.url = url
+        self.base_url = base_url  # Base URL for markdown link resolution
 
         # Content Processing Parameters
         self.word_count_threshold = word_count_threshold
@@ -921,9 +1545,20 @@ class CrawlerRunConfig():
         self.remove_forms = remove_forms
         self.prettiify = prettiify
         self.parser_type = parser_type
-        self.scraping_strategy = scraping_strategy or WebScrapingStrategy()
-        self.proxy_config = proxy_config
+        self.scraping_strategy = scraping_strategy or LXMLWebScrapingStrategy()
+        self.proxy_config = proxy_config  # runs through property setter
+
         self.proxy_rotation_strategy = proxy_rotation_strategy
+
+        # Sticky Proxy Session Parameters
+        self.proxy_session_id = proxy_session_id
+        self.proxy_session_ttl = proxy_session_ttl
+        self.proxy_session_auto_release = proxy_session_auto_release
+
+        # Browser Location and Identity Parameters
+        self.locale = locale
+        self.timezone_id = timezone_id
+        self.geolocation = geolocation
 
         # SSL Parameters
         self.fetch_ssl_certificate = fetch_ssl_certificate
@@ -936,11 +1571,15 @@ class CrawlerRunConfig():
         self.no_cache_read = no_cache_read
         self.no_cache_write = no_cache_write
         self.shared_data = shared_data
+        # Cache Validation (Smart Cache)
+        self.check_cache_freshness = check_cache_freshness
+        self.cache_validation_timeout = cache_validation_timeout
 
         # Page Navigation and Timing Parameters
         self.wait_until = wait_until
         self.page_timeout = page_timeout
         self.wait_for = wait_for
+        self.wait_for_timeout = wait_for_timeout
         self.wait_for_images = wait_for_images
         self.delay_before_return_html = delay_before_return_html
         self.mean_delay = mean_delay
@@ -949,12 +1588,17 @@ class CrawlerRunConfig():
 
         # Page Interaction Parameters
         self.js_code = js_code
+        self.js_code_before_wait = js_code_before_wait
+        self.c4a_script = c4a_script
         self.js_only = js_only
         self.ignore_body_visibility = ignore_body_visibility
         self.scan_full_page = scan_full_page
         self.scroll_delay = scroll_delay
+        self.max_scroll_steps = max_scroll_steps
         self.process_iframes = process_iframes
+        self.flatten_shadow_dom = flatten_shadow_dom
         self.remove_overlay_elements = remove_overlay_elements
+        self.remove_consent_popups = remove_consent_popups
         self.simulate_user = simulate_user
         self.override_navigator = override_navigator
         self.magic = magic
@@ -964,6 +1608,7 @@ class CrawlerRunConfig():
         self.screenshot = screenshot
         self.screenshot_wait_for = screenshot_wait_for
         self.screenshot_height_threshold = screenshot_height_threshold
+        self.force_viewport_screenshot = force_viewport_screenshot
         self.pdf = pdf
         self.capture_mhtml = capture_mhtml
         self.image_description_min_word_threshold = image_description_min_word_threshold
@@ -971,6 +1616,12 @@ class CrawlerRunConfig():
         self.exclude_external_images = exclude_external_images
         self.exclude_all_images = exclude_all_images
         self.table_score_threshold = table_score_threshold
+        
+        # Table extraction strategy (default to DefaultTableExtraction if not specified)
+        if table_extraction is None:
+            self.table_extraction = DefaultTableExtraction(table_score_threshold=table_score_threshold)
+        else:
+            self.table_extraction = table_extraction
 
         # Link and Domain Handling Parameters
         self.exclude_social_media_domains = (
@@ -980,6 +1631,8 @@ class CrawlerRunConfig():
         self.exclude_social_media_links = exclude_social_media_links
         self.exclude_domains = exclude_domains or []
         self.exclude_internal_links = exclude_internal_links
+        self.score_links = score_links
+        self.preserve_https_for_internal_links = preserve_https_for_internal_links
 
         # Debugging and Logging Parameters
         self.verbose = verbose
@@ -991,6 +1644,8 @@ class CrawlerRunConfig():
 
         # Connection Parameters
         self.stream = stream
+        self.prefetch = prefetch  # Prefetch mode: return only HTML + links
+        self.process_in_browser = process_in_browser  # Force browser processing for raw:/file:// URLs
         self.method = method
 
         # Robots.txt Handling Parameters
@@ -1014,6 +1669,19 @@ class CrawlerRunConfig():
             raise ValueError(
                 "chunking_strategy must be an instance of ChunkingStrategy"
             )
+        if self.markdown_generator is not None and not isinstance(
+            self.markdown_generator, MarkdownGenerationStrategy
+        ):
+            hint = ""
+            if isinstance(self.markdown_generator, dict):
+                hint = (
+                    ' The JSON format must be {"type": "<ClassName>", "params": {...}}.'
+                    ' Note: "params" is required — "options" or other keys are not recognized.'
+                )
+            raise ValueError(
+                "markdown_generator must be an instance of MarkdownGenerationStrategy, "
+                f"got {type(self.markdown_generator).__name__}.{hint}"
+            )
 
         # Set default chunking strategy if None
         if self.chunking_strategy is None:
@@ -1022,8 +1690,175 @@ class CrawlerRunConfig():
         # Deep Crawl Parameters
         self.deep_crawl_strategy = deep_crawl_strategy
         
+        # Link Extraction Parameters
+        if link_preview_config is None:
+            self.link_preview_config = None
+        elif isinstance(link_preview_config, LinkPreviewConfig):
+            self.link_preview_config = link_preview_config
+        elif isinstance(link_preview_config, dict):
+            # Convert dict to config object for backward compatibility
+            self.link_preview_config = LinkPreviewConfig.from_dict(link_preview_config)
+        else:
+            raise ValueError("link_preview_config must be LinkPreviewConfig object or dict")
+        
+        # Virtual Scroll Parameters
+        if virtual_scroll_config is None:
+            self.virtual_scroll_config = None
+        elif isinstance(virtual_scroll_config, VirtualScrollConfig):
+            self.virtual_scroll_config = virtual_scroll_config
+        elif isinstance(virtual_scroll_config, dict):
+            # Convert dict to config object for backward compatibility
+            self.virtual_scroll_config = VirtualScrollConfig.from_dict(virtual_scroll_config)
+        else:
+            raise ValueError("virtual_scroll_config must be VirtualScrollConfig object or dict")
+        
+        # URL Matching Parameters
+        self.url_matcher = url_matcher
+        self.match_mode = match_mode
+        
         # Experimental Parameters
         self.experimental = experimental or {}
+
+        # Anti-Bot Retry Parameters
+        self.max_retries = max_retries
+        self.fallback_fetch_function = fallback_fetch_function
+
+        # Compile C4A scripts if provided
+        if self.c4a_script and not self.js_code:
+            self._compile_c4a_script()
+
+
+    @staticmethod
+    def _normalize_proxy_config(value):
+        """Normalize proxy_config to ProxyConfig, list of ProxyConfig/None, or None."""
+        if isinstance(value, list):
+            normalized = []
+            for p in value:
+                if p is None or p == "direct":
+                    normalized.append(None)
+                elif isinstance(p, dict):
+                    normalized.append(ProxyConfig.from_dict(p))
+                elif isinstance(p, str):
+                    normalized.append(ProxyConfig.from_string(p))
+                else:
+                    normalized.append(p)
+            return normalized
+        elif isinstance(value, dict):
+            return ProxyConfig.from_dict(value)
+        elif isinstance(value, str):
+            if value == "direct":
+                return None
+            return ProxyConfig.from_string(value)
+        return value  # ProxyConfig or None
+
+    @property
+    def proxy_config(self):
+        return self._proxy_config
+
+    @proxy_config.setter
+    def proxy_config(self, value):
+        self._proxy_config = CrawlerRunConfig._normalize_proxy_config(value)
+
+    def _get_proxy_list(self) -> list:
+        """Normalize proxy_config to a list for the retry loop."""
+        if self.proxy_config is None:
+            return [None]
+        if isinstance(self.proxy_config, list):
+            return self.proxy_config if self.proxy_config else [None]
+        return [self.proxy_config]
+
+    def _compile_c4a_script(self):
+        """Compile C4A script to JavaScript"""
+        try:
+            # Try importing the compiler
+            try:
+                from .script import compile
+            except ImportError:
+                from crawl4ai.script import compile
+                
+            # Handle both string and list inputs
+            if isinstance(self.c4a_script, str):
+                scripts = [self.c4a_script]
+            else:
+                scripts = self.c4a_script
+                
+            # Compile each script
+            compiled_js = []
+            for i, script in enumerate(scripts):
+                result = compile(script)
+                
+                if result.success:
+                    compiled_js.extend(result.js_code)
+                else:
+                    # Format error message following existing patterns
+                    error = result.first_error
+                    error_msg = (
+                        f"C4A Script compilation error (script {i+1}):\n"
+                        f"  Line {error.line}, Column {error.column}: {error.message}\n"
+                        f"  Code: {error.source_line}"
+                    )
+                    if error.suggestions:
+                        error_msg += f"\n  Suggestion: {error.suggestions[0].message}"
+                        
+                    raise ValueError(error_msg)
+                    
+            self.js_code = compiled_js
+            
+        except ImportError:
+            raise ValueError(
+                "C4A script compiler not available. "
+                "Please ensure crawl4ai.script module is properly installed."
+            )
+        except Exception as e:
+            # Re-raise with context
+            if "compilation error" not in str(e).lower():
+                raise ValueError(f"Failed to compile C4A script: {str(e)}")
+            raise
+    
+    def is_match(self, url: str) -> bool:
+        """Check if this config matches the given URL.
+        
+        Args:
+            url: The URL to check against this config's matcher
+            
+        Returns:
+            bool: True if this config should be used for the URL or if no matcher is set.
+        """
+        if self.url_matcher is None:
+            return True
+            
+        if callable(self.url_matcher):
+            # Single function matcher
+            return self.url_matcher(url)
+        
+        elif isinstance(self.url_matcher, str):
+            # Single pattern string
+            from fnmatch import fnmatch
+            return fnmatch(url, self.url_matcher)
+        
+        elif isinstance(self.url_matcher, list):
+            # List of mixed matchers
+            if not self.url_matcher:  # Empty list
+                return False
+                
+            results = []
+            for matcher in self.url_matcher:
+                if callable(matcher):
+                    results.append(matcher(url))
+                elif isinstance(matcher, str):
+                    from fnmatch import fnmatch
+                    results.append(fnmatch(url, matcher))
+                else:
+                    # Skip invalid matchers
+                    continue
+            
+            # Apply match mode logic
+            if self.match_mode == MatchMode.OR:
+                return any(results) if results else False
+            else:  # AND mode
+                return all(results) if results else False
+        
+        return False
 
 
     def __getattr__(self, name):
@@ -1045,101 +1880,17 @@ class CrawlerRunConfig():
 
     @staticmethod
     def from_kwargs(kwargs: dict) -> "CrawlerRunConfig":
-        return CrawlerRunConfig(
-            # Content Processing Parameters
-            word_count_threshold=kwargs.get("word_count_threshold", 200),
-            extraction_strategy=kwargs.get("extraction_strategy"),
-            chunking_strategy=kwargs.get("chunking_strategy", RegexChunking()),
-            markdown_generator=kwargs.get("markdown_generator"),
-            only_text=kwargs.get("only_text", False),
-            css_selector=kwargs.get("css_selector"),
-            target_elements=kwargs.get("target_elements", []),
-            excluded_tags=kwargs.get("excluded_tags", []),
-            excluded_selector=kwargs.get("excluded_selector", ""),
-            keep_data_attributes=kwargs.get("keep_data_attributes", False),
-            keep_attrs=kwargs.get("keep_attrs", []),
-            remove_forms=kwargs.get("remove_forms", False),
-            prettiify=kwargs.get("prettiify", False),
-            parser_type=kwargs.get("parser_type", "lxml"),
-            scraping_strategy=kwargs.get("scraping_strategy"),
-            proxy_config=kwargs.get("proxy_config"),
-            proxy_rotation_strategy=kwargs.get("proxy_rotation_strategy"),
-            # SSL Parameters
-            fetch_ssl_certificate=kwargs.get("fetch_ssl_certificate", False),
-            # Caching Parameters
-            cache_mode=kwargs.get("cache_mode", CacheMode.BYPASS),
-            session_id=kwargs.get("session_id"),
-            bypass_cache=kwargs.get("bypass_cache", False),
-            disable_cache=kwargs.get("disable_cache", False),
-            no_cache_read=kwargs.get("no_cache_read", False),
-            no_cache_write=kwargs.get("no_cache_write", False),
-            shared_data=kwargs.get("shared_data", None),
-            # Page Navigation and Timing Parameters
-            wait_until=kwargs.get("wait_until", "domcontentloaded"),
-            page_timeout=kwargs.get("page_timeout", 60000),
-            wait_for=kwargs.get("wait_for"),
-            wait_for_images=kwargs.get("wait_for_images", False),
-            delay_before_return_html=kwargs.get("delay_before_return_html", 0.1),
-            mean_delay=kwargs.get("mean_delay", 0.1),
-            max_range=kwargs.get("max_range", 0.3),
-            semaphore_count=kwargs.get("semaphore_count", 5),
-            # Page Interaction Parameters
-            js_code=kwargs.get("js_code"),
-            js_only=kwargs.get("js_only", False),
-            ignore_body_visibility=kwargs.get("ignore_body_visibility", True),
-            scan_full_page=kwargs.get("scan_full_page", False),
-            scroll_delay=kwargs.get("scroll_delay", 0.2),
-            process_iframes=kwargs.get("process_iframes", False),
-            remove_overlay_elements=kwargs.get("remove_overlay_elements", False),
-            simulate_user=kwargs.get("simulate_user", False),
-            override_navigator=kwargs.get("override_navigator", False),
-            magic=kwargs.get("magic", False),
-            adjust_viewport_to_content=kwargs.get("adjust_viewport_to_content", False),
-            # Media Handling Parameters
-            screenshot=kwargs.get("screenshot", False),
-            screenshot_wait_for=kwargs.get("screenshot_wait_for"),
-            screenshot_height_threshold=kwargs.get(
-                "screenshot_height_threshold", SCREENSHOT_HEIGHT_TRESHOLD
-            ),
-            pdf=kwargs.get("pdf", False),
-            capture_mhtml=kwargs.get("capture_mhtml", False),
-            image_description_min_word_threshold=kwargs.get(
-                "image_description_min_word_threshold",
-                IMAGE_DESCRIPTION_MIN_WORD_THRESHOLD,
-            ),
-            image_score_threshold=kwargs.get(
-                "image_score_threshold", IMAGE_SCORE_THRESHOLD
-            ),
-            table_score_threshold=kwargs.get("table_score_threshold", 7),
-            exclude_all_images=kwargs.get("exclude_all_images", False),
-            exclude_external_images=kwargs.get("exclude_external_images", False),
-            # Link and Domain Handling Parameters
-            exclude_social_media_domains=kwargs.get(
-                "exclude_social_media_domains", SOCIAL_MEDIA_DOMAINS
-            ),
-            exclude_external_links=kwargs.get("exclude_external_links", False),
-            exclude_social_media_links=kwargs.get("exclude_social_media_links", False),
-            exclude_domains=kwargs.get("exclude_domains", []),
-            exclude_internal_links=kwargs.get("exclude_internal_links", False),
-            # Debugging and Logging Parameters
-            verbose=kwargs.get("verbose", True),
-            log_console=kwargs.get("log_console", False),
-            # Network and Console Capturing Parameters
-            capture_network_requests=kwargs.get("capture_network_requests", False),
-            capture_console_messages=kwargs.get("capture_console_messages", False),
-            # Connection Parameters
-            method=kwargs.get("method", "GET"),
-            stream=kwargs.get("stream", False),
-            check_robots_txt=kwargs.get("check_robots_txt", False),
-            user_agent=kwargs.get("user_agent"),
-            user_agent_mode=kwargs.get("user_agent_mode"),
-            user_agent_generator_config=kwargs.get("user_agent_generator_config", {}),
-            # Deep Crawl Parameters
-            deep_crawl_strategy=kwargs.get("deep_crawl_strategy"),
-            url=kwargs.get("url"),
-            # Experimental Parameters 
-            experimental=kwargs.get("experimental"),
-        )
+        # Auto-deserialize any dict values that use the {"type": ..., "params": ...}
+        # serialization format (e.g. from JSON API requests or dump()/load() roundtrips).
+        # This covers markdown_generator, extraction_strategy, content_filter, etc.
+        kwargs = {
+            k: from_serializable_dict(v) if isinstance(v, dict) and "type" in v else v
+            for k, v in kwargs.items()
+        }
+        # Only pass keys present in kwargs so that __init__ defaults (and
+        # set_defaults() overrides) are respected for missing keys.
+        valid = inspect.signature(CrawlerRunConfig.__init__).parameters.keys() - {"self"}
+        return CrawlerRunConfig(**{k: v for k, v in kwargs.items() if k in valid})
 
     # Create a funciton returns dict of the object
     def dump(self) -> dict:
@@ -1171,8 +1922,18 @@ class CrawlerRunConfig():
             "prettiify": self.prettiify,
             "parser_type": self.parser_type,
             "scraping_strategy": self.scraping_strategy,
-            "proxy_config": self.proxy_config,
+            "proxy_config": (
+                [p.to_dict() if hasattr(p, 'to_dict') else p for p in self.proxy_config]
+                if isinstance(self.proxy_config, list)
+                else (self.proxy_config.to_dict() if hasattr(self.proxy_config, 'to_dict') else self.proxy_config)
+            ),
             "proxy_rotation_strategy": self.proxy_rotation_strategy,
+            "proxy_session_id": self.proxy_session_id,
+            "proxy_session_ttl": self.proxy_session_ttl,
+            "proxy_session_auto_release": self.proxy_session_auto_release,
+            "locale": self.locale,
+            "timezone_id": self.timezone_id,
+            "geolocation": self.geolocation,
             "fetch_ssl_certificate": self.fetch_ssl_certificate,
             "cache_mode": self.cache_mode,
             "session_id": self.session_id,
@@ -1184,18 +1945,23 @@ class CrawlerRunConfig():
             "wait_until": self.wait_until,
             "page_timeout": self.page_timeout,
             "wait_for": self.wait_for,
+            "wait_for_timeout": self.wait_for_timeout,
             "wait_for_images": self.wait_for_images,
             "delay_before_return_html": self.delay_before_return_html,
             "mean_delay": self.mean_delay,
             "max_range": self.max_range,
             "semaphore_count": self.semaphore_count,
             "js_code": self.js_code,
+            "js_code_before_wait": self.js_code_before_wait,
             "js_only": self.js_only,
             "ignore_body_visibility": self.ignore_body_visibility,
             "scan_full_page": self.scan_full_page,
             "scroll_delay": self.scroll_delay,
+            "max_scroll_steps": self.max_scroll_steps,
             "process_iframes": self.process_iframes,
+            "flatten_shadow_dom": self.flatten_shadow_dom,
             "remove_overlay_elements": self.remove_overlay_elements,
+            "remove_consent_popups": self.remove_consent_popups,
             "simulate_user": self.simulate_user,
             "override_navigator": self.override_navigator,
             "magic": self.magic,
@@ -1208,6 +1974,7 @@ class CrawlerRunConfig():
             "image_description_min_word_threshold": self.image_description_min_word_threshold,
             "image_score_threshold": self.image_score_threshold,
             "table_score_threshold": self.table_score_threshold,
+            "table_extraction": self.table_extraction,
             "exclude_all_images": self.exclude_all_images,
             "exclude_external_images": self.exclude_external_images,
             "exclude_social_media_domains": self.exclude_social_media_domains,
@@ -1215,19 +1982,27 @@ class CrawlerRunConfig():
             "exclude_social_media_links": self.exclude_social_media_links,
             "exclude_domains": self.exclude_domains,
             "exclude_internal_links": self.exclude_internal_links,
+            "score_links": self.score_links,
+            "preserve_https_for_internal_links": self.preserve_https_for_internal_links,
             "verbose": self.verbose,
             "log_console": self.log_console,
             "capture_network_requests": self.capture_network_requests,
             "capture_console_messages": self.capture_console_messages,
             "method": self.method,
             "stream": self.stream,
+            "prefetch": self.prefetch,
+            "process_in_browser": self.process_in_browser,
             "check_robots_txt": self.check_robots_txt,
             "user_agent": self.user_agent,
             "user_agent_mode": self.user_agent_mode,
             "user_agent_generator_config": self.user_agent_generator_config,
             "deep_crawl_strategy": self.deep_crawl_strategy,
+            "link_preview_config": self.link_preview_config.to_dict() if self.link_preview_config else None,
             "url": self.url,
+            "url_matcher": self.url_matcher,
+            "match_mode": self.match_mode,
             "experimental": self.experimental,
+            "max_retries": self.max_retries,
         }
 
     def clone(self, **kwargs):
@@ -1256,7 +2031,6 @@ class CrawlerRunConfig():
         config_dict.update(kwargs)
         return CrawlerRunConfig.from_kwargs(config_dict)
 
-
 class LLMConfig:
     def __init__(
         self,
@@ -1269,7 +2043,10 @@ class LLMConfig:
         frequency_penalty: Optional[float] = None,
         presence_penalty: Optional[float] = None,
         stop: Optional[List[str]] = None,
-        n: Optional[int] = None,    
+        n: Optional[int] = None,
+        backoff_base_delay: Optional[int] = None,
+        backoff_max_attempts: Optional[int] = None,
+        backoff_exponential_factor: Optional[int] = None,
     ):
         """Configuaration class for LLM provider and API token."""
         self.provider = provider
@@ -1298,6 +2075,9 @@ class LLMConfig:
         self.presence_penalty = presence_penalty
         self.stop = stop
         self.n = n
+        self.backoff_base_delay = backoff_base_delay if backoff_base_delay is not None else 2
+        self.backoff_max_attempts = backoff_max_attempts if backoff_max_attempts is not None else 3
+        self.backoff_exponential_factor = backoff_exponential_factor if backoff_exponential_factor is not None else 2
 
     @staticmethod
     def from_kwargs(kwargs: dict) -> "LLMConfig":
@@ -1311,7 +2091,10 @@ class LLMConfig:
             frequency_penalty=kwargs.get("frequency_penalty"),
             presence_penalty=kwargs.get("presence_penalty"),
             stop=kwargs.get("stop"),
-            n=kwargs.get("n")
+            n=kwargs.get("n"),
+            backoff_base_delay=kwargs.get("backoff_base_delay"),
+            backoff_max_attempts=kwargs.get("backoff_max_attempts"),
+            backoff_exponential_factor=kwargs.get("backoff_exponential_factor")
         )
 
     def to_dict(self):
@@ -1325,7 +2108,10 @@ class LLMConfig:
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
             "stop": self.stop,
-            "n": self.n
+            "n": self.n,
+            "backoff_base_delay": self.backoff_base_delay,
+            "backoff_max_attempts": self.backoff_max_attempts,
+            "backoff_exponential_factor": self.backoff_exponential_factor
         }
 
     def clone(self, **kwargs):
@@ -1341,19 +2127,112 @@ class LLMConfig:
         config_dict.update(kwargs)
         return LLMConfig.from_kwargs(config_dict)
 
+class SeedingConfig:
+    """
+    Configuration class for URL discovery and pre-validation via AsyncUrlSeeder.
+    """
+    def __init__(
+        self,
+        source: str = "sitemap+cc",
+        pattern: Optional[str] = "*",
+        live_check: bool = False,
+        extract_head: bool = False,
+        max_urls: int = -1,
+        concurrency: int = 1000,
+        hits_per_sec: int = 5,
+        force: bool = False,
+        base_directory: Optional[str] = None,
+        llm_config: Optional[LLMConfig] = None,
+        verbose: Optional[bool] = None,
+        query: Optional[str] = None,
+        score_threshold: Optional[float] = None,
+        scoring_method: str = "bm25",
+        filter_nonsense_urls: bool = True,
+        cache_ttl_hours: int = 24,
+        validate_sitemap_lastmod: bool = True,
+    ):
+        """
+        Initialize URL seeding configuration.
+        
+        Args:
+            source: Discovery source(s) to use. Options: "sitemap", "cc" (Common Crawl), 
+                   or "sitemap+cc" (both). Default: "sitemap+cc"
+            pattern: URL pattern to filter discovered URLs (e.g., "*example.com/blog/*"). 
+                    Supports glob-style wildcards. Default: "*" (all URLs)
+            live_check: Whether to perform HEAD requests to verify URL liveness. 
+                       Default: False
+            extract_head: Whether to fetch and parse <head> section for metadata extraction.
+                         Required for BM25 relevance scoring. Default: False
+            max_urls: Maximum number of URLs to discover. Use -1 for no limit. 
+                     Default: -1
+            concurrency: Maximum concurrent requests for live checks/head extraction. 
+                        Default: 1000
+            hits_per_sec: Rate limit in requests per second to avoid overwhelming servers. 
+                         Default: 5
+            force: If True, bypasses the AsyncUrlSeeder's internal .jsonl cache and 
+                  re-fetches URLs. Default: False
+            base_directory: Base directory for UrlSeeder's cache files (.jsonl). 
+                           If None, uses default ~/.crawl4ai/. Default: None
+            llm_config: LLM configuration for future features (e.g., semantic scoring). 
+                       Currently unused. Default: None
+            verbose: Override crawler's general verbose setting for seeding operations. 
+                    Default: None (inherits from crawler)
+            query: Search query for BM25 relevance scoring (e.g., "python tutorials"). 
+                  Requires extract_head=True. Default: None
+            score_threshold: Minimum relevance score (0.0-1.0) to include URL. 
+                           Only applies when query is provided. Default: None
+            scoring_method: Scoring algorithm to use. Currently only "bm25" is supported.
+                          Future: "semantic". Default: "bm25"
+            filter_nonsense_urls: Filter out utility URLs like robots.txt, sitemap.xml,
+                                 ads.txt, favicon.ico, etc. Default: True
+            cache_ttl_hours: Hours before sitemap cache expires. Set to 0 to disable TTL
+                            (only lastmod validation). Default: 24
+            validate_sitemap_lastmod: If True, compares sitemap's <lastmod> with cache
+                                     timestamp and refetches if sitemap is newer. Default: True
+        """
+        self.source = source
+        self.pattern = pattern
+        self.live_check = live_check
+        self.extract_head = extract_head
+        self.max_urls = max_urls
+        self.concurrency = concurrency
+        self.hits_per_sec = hits_per_sec
+        self.force = force
+        self.base_directory = base_directory
+        self.llm_config = llm_config
+        self.verbose = verbose
+        self.query = query
+        self.score_threshold = score_threshold
+        self.scoring_method = scoring_method
+        self.filter_nonsense_urls = filter_nonsense_urls
+        self.cache_ttl_hours = cache_ttl_hours
+        self.validate_sitemap_lastmod = validate_sitemap_lastmod
 
+    # Add to_dict, from_kwargs, and clone methods for consistency
+    def to_dict(self) -> Dict[str, Any]:
+        return {k: v for k, v in self.__dict__.items() if k != 'llm_config' or v is not None}
+
+    @staticmethod
+    def from_kwargs(kwargs: Dict[str, Any]) -> 'SeedingConfig':
+        return SeedingConfig(**kwargs)
+
+    def clone(self, **kwargs: Any) -> 'SeedingConfig':
+        config_dict = self.to_dict()
+        config_dict.update(kwargs)
+        return SeedingConfig.from_kwargs(config_dict)
 
 ```
 
 
 ## File: crawl4ai/async_webcrawler.py
 
+
 ```py
 from .__version__ import __version__ as crawl4ai_version
 import os
+import re
 import sys
 import time
-from colorama import Fore
 from pathlib import Path
 from typing import Optional, List
 import json
@@ -1387,19 +2266,22 @@ from .markdown_generation_strategy import (
 )
 from .deep_crawling import DeepCrawlDecorator
 from .async_logger import AsyncLogger, AsyncLoggerBase
-from .async_configs import BrowserConfig, CrawlerRunConfig, ProxyConfig
+from .async_configs import BrowserConfig, CrawlerRunConfig, ProxyConfig, SeedingConfig
 from .async_dispatcher import *  # noqa: F403
 from .async_dispatcher import BaseDispatcher, MemoryAdaptiveDispatcher, RateLimiter
+from .async_url_seeder import AsyncUrlSeeder
 
 from .utils import (
     sanitize_input_encode,
     InvalidCSSSelectorError,
     fast_format_html,
-    create_box_message,
     get_error_context,
     RobotsParser,
     preprocess_html_for_schema,
+    compute_head_fingerprint,
 )
+from .cache_validator import CacheValidator, CacheValidationResult
+from .antibot_detector import is_blocked
 
 
 class AsyncWebCrawler:
@@ -1516,6 +2398,8 @@ class AsyncWebCrawler:
         # Decorate arun method with deep crawling capabilities
         self._deep_handler = DeepCrawlDecorator(self)
         self.arun = self._deep_handler(self.arun)
+        
+        self.url_seeder: Optional[AsyncUrlSeeder] = None
 
     async def start(self):
         """
@@ -1575,11 +2459,11 @@ class AsyncWebCrawler:
                 screenshot=True,
                 ...
             )
-            result = await crawler.arun(url="https://example.com", crawler_config=config)
+            result = await crawler.arun(url="https://example.com", config=config)
 
         Args:
             url: The URL to crawl (http://, https://, file://, or raw:)
-            crawler_config: Configuration object controlling crawl behavior
+            config: Configuration object controlling crawl behavior
             [other parameters maintained for backwards compatibility]
 
         Returns:
@@ -1597,6 +2481,20 @@ class AsyncWebCrawler:
         async with self._lock or self.nullcontext():
             try:
                 self.logger.verbose = config.verbose
+
+                if config.verbose:
+                    import json as _json
+                    bc_dict = self.browser_config.to_dict() if hasattr(self.browser_config, 'to_dict') else vars(self.browser_config)
+                    cc_dict = config.to_dict() if hasattr(config, 'to_dict') else vars(config)
+                    self.logger.info(
+                        message="Crawling {url}\n  BrowserConfig: {browser_config}\n  CrawlerRunConfig: {crawler_config}",
+                        tag="CRAWL",
+                        params={
+                            "url": url,
+                            "browser_config": _json.dumps({k: str(v) for k, v in bc_dict.items()}, default=str, ensure_ascii=False),
+                            "crawler_config": _json.dumps({k: str(v) for k, v in cc_dict.items()}, default=str, ensure_ascii=False),
+                        },
+                    )
 
                 # Default to ENABLED if no cache mode specified
                 if config.cache_mode is None:
@@ -1616,6 +2514,51 @@ class AsyncWebCrawler:
                 # Try to get cached result if appropriate
                 if cache_context.should_read():
                     cached_result = await async_db_manager.aget_cached_url(url)
+
+                # Smart Cache: Validate cache freshness if enabled
+                if cached_result and config.check_cache_freshness:
+                    cache_metadata = await async_db_manager.aget_cache_metadata(url)
+                    if cache_metadata:
+                        async with CacheValidator(timeout=config.cache_validation_timeout) as validator:
+                            validation = await validator.validate(
+                                url=url,
+                                stored_etag=cache_metadata.get("etag"),
+                                stored_last_modified=cache_metadata.get("last_modified"),
+                                stored_head_fingerprint=cache_metadata.get("head_fingerprint"),
+                            )
+
+                        if validation.status == CacheValidationResult.FRESH:
+                            cached_result.cache_status = "hit_validated"
+                            self.logger.info(
+                                message="Cache validated: {reason}",
+                                tag="CACHE",
+                                params={"reason": validation.reason}
+                            )
+                            # Update metadata if we got new values
+                            if validation.new_etag or validation.new_last_modified:
+                                await async_db_manager.aupdate_cache_metadata(
+                                    url=url,
+                                    etag=validation.new_etag,
+                                    last_modified=validation.new_last_modified,
+                                    head_fingerprint=validation.new_head_fingerprint,
+                                )
+                        elif validation.status == CacheValidationResult.ERROR:
+                            cached_result.cache_status = "hit_fallback"
+                            self.logger.warning(
+                                message="Cache validation failed, using cached: {reason}",
+                                tag="CACHE",
+                                params={"reason": validation.reason}
+                            )
+                        else:
+                            # STALE or UNKNOWN - force recrawl
+                            self.logger.info(
+                                message="Cache stale: {reason}",
+                                tag="CACHE",
+                                params={"reason": validation.reason}
+                            )
+                            cached_result = None
+                elif cached_result:
+                    cached_result.cache_status = "hit"
 
                 if cached_result:
                     html = sanitize_input_encode(cached_result.html)
@@ -1646,25 +2589,38 @@ class AsyncWebCrawler:
 
                 # Update proxy configuration from rotation strategy if available
                 if config and config.proxy_rotation_strategy:
-                    next_proxy: ProxyConfig = await config.proxy_rotation_strategy.get_next_proxy()
-                    if next_proxy:
-                        self.logger.info(
-                            message="Switch proxy: {proxy}",
-                            tag="PROXY",
-                            params={"proxy": next_proxy.server}
+                    # Handle sticky sessions - use same proxy for all requests with same session_id
+                    if config.proxy_session_id:
+                        next_proxy: ProxyConfig = await config.proxy_rotation_strategy.get_proxy_for_session(
+                            config.proxy_session_id,
+                            ttl=config.proxy_session_ttl
                         )
-                        config.proxy_config = next_proxy
-                        # config = config.clone(proxy_config=next_proxy)
+                        if next_proxy:
+                            self.logger.info(
+                                message="Using sticky proxy session: {session_id} -> {proxy}",
+                                tag="PROXY",
+                                params={
+                                    "session_id": config.proxy_session_id,
+                                    "proxy": next_proxy.server
+                                }
+                            )
+                            config.proxy_config = next_proxy
+                    else:
+                        # Existing behavior: rotate on each request
+                        next_proxy: ProxyConfig = await config.proxy_rotation_strategy.get_next_proxy()
+                        if next_proxy:
+                            self.logger.info(
+                                message="Switch proxy: {proxy}",
+                                tag="PROXY",
+                                params={"proxy": next_proxy.server}
+                            )
+                            config.proxy_config = next_proxy
 
                 # Fetch fresh content if needed
                 if not cached_result or not html:
-                    t1 = time.perf_counter()
+                    from urllib.parse import urlparse
 
-                    if config.user_agent:
-                        self.crawler_strategy.update_user_agent(
-                            config.user_agent)
-
-                    # Check robots.txt if enabled
+                    # Check robots.txt if enabled (once, before any attempts)
                     if config and config.check_robots_txt:
                         if not await self.robots_parser.can_fetch(
                             url, self.browser_config.user_agent
@@ -1680,69 +2636,261 @@ class AsyncWebCrawler:
                                 },
                             )
 
-                    ##############################
-                    # Call CrawlerStrategy.crawl #
-                    ##############################
-                    async_response = await self.crawler_strategy.crawl(
-                        url,
-                        config=config,  # Pass the entire config object
-                    )
+                    # --- Anti-bot retry setup ---
+                    # raw: URLs contain caller-provided HTML (e.g. from cache),
+                    # not content fetched from a web server.  Anti-bot detection,
+                    # proxy retries, and fallback fetching are meaningless here.
+                    _is_raw_url = url.startswith("raw:") or url.startswith("raw://")
 
-                    html = sanitize_input_encode(async_response.html)
-                    screenshot_data = async_response.screenshot
-                    pdf_data = async_response.pdf_data
-                    js_execution_result = async_response.js_execution_result
+                    _max_attempts = 1 + getattr(config, "max_retries", 0)
+                    _proxy_list = config._get_proxy_list()
+                    _original_proxy_config = config.proxy_config
+                    _block_reason = ""
+                    _done = False
+                    crawl_result = None
+                    _crawl_stats = {
+                        "attempts": 0,
+                        "retries": 0,
+                        "proxies_used": [],
+                        "fallback_fetch_used": False,
+                        "resolved_by": None,
+                    }
 
-                    t2 = time.perf_counter()
+                    for _attempt in range(_max_attempts):
+                        if _done:
+                            break
+
+                        if _attempt > 0:
+                            _crawl_stats["retries"] = _attempt
+                            self.logger.warning(
+                                message="Anti-bot retry {attempt}/{max_retries} for {url} — {reason}",
+                                tag="ANTIBOT",
+                                params={
+                                    "attempt": _attempt,
+                                    "max_retries": config.max_retries,
+                                    "url": url[:80],
+                                    "reason": _block_reason,
+                                },
+                            )
+
+                        for _p_idx, _proxy in enumerate(_proxy_list):
+                            if _p_idx > 0 or _attempt > 0:
+                                self.logger.info(
+                                    message="Trying proxy {idx}/{total}: {proxy}",
+                                    tag="ANTIBOT",
+                                    params={
+                                        "idx": _p_idx + 1,
+                                        "total": len(_proxy_list),
+                                        "proxy": _proxy.server if _proxy else "direct",
+                                    },
+                                )
+
+                            # Set the active proxy for this attempt
+                            config.proxy_config = _proxy
+                            _crawl_stats["attempts"] += 1
+
+                            try:
+                                t1 = time.perf_counter()
+
+                                if config.user_agent:
+                                    self.crawler_strategy.update_user_agent(
+                                        config.user_agent)
+
+                                async_response = await self.crawler_strategy.crawl(
+                                    url, config=config)
+
+                                html = sanitize_input_encode(async_response.html)
+                                screenshot_data = async_response.screenshot
+                                pdf_data = async_response.pdf_data
+                                js_execution_result = async_response.js_execution_result
+
+                                self.logger.url_status(
+                                    url=cache_context.display_url,
+                                    success=bool(html),
+                                    timing=time.perf_counter() - t1,
+                                    tag="FETCH",
+                                )
+
+                                crawl_result = await self.aprocess_html(
+                                    url=url, html=html,
+                                    extracted_content=extracted_content,
+                                    config=config,
+                                    screenshot_data=screenshot_data,
+                                    pdf_data=pdf_data,
+                                    verbose=config.verbose,
+                                    is_raw_html=True if url.startswith("raw:") else False,
+                                    redirected_url=async_response.redirected_url,
+                                    original_scheme=urlparse(url).scheme,
+                                    **kwargs,
+                                )
+
+                                crawl_result.status_code = async_response.status_code
+                                is_raw_url = url.startswith("raw:") or url.startswith("raw://")
+                                crawl_result.redirected_url = async_response.redirected_url or (None if is_raw_url else url)
+                                crawl_result.redirected_status_code = async_response.redirected_status_code
+                                crawl_result.response_headers = async_response.response_headers
+                                crawl_result.downloaded_files = async_response.downloaded_files
+                                crawl_result.js_execution_result = js_execution_result
+                                crawl_result.mhtml = async_response.mhtml_data
+                                crawl_result.ssl_certificate = async_response.ssl_certificate
+                                crawl_result.network_requests = async_response.network_requests
+                                crawl_result.console_messages = async_response.console_messages
+                                crawl_result.success = bool(html)
+                                crawl_result.session_id = getattr(config, "session_id", None)
+                                crawl_result.cache_status = "miss"
+
+                                # Check if blocked (skip for raw: URLs —
+                                # caller-provided content, anti-bot N/A)
+                                if _is_raw_url:
+                                    _blocked = False
+                                    _block_reason = ""
+                                else:
+                                    _blocked, _block_reason = is_blocked(
+                                        async_response.status_code, html)
+
+                                _crawl_stats["proxies_used"].append({
+                                    "proxy": _proxy.server if _proxy else None,
+                                    "status_code": async_response.status_code,
+                                    "blocked": _blocked,
+                                    "reason": _block_reason if _blocked else "",
+                                })
+
+                                if not _blocked:
+                                    _crawl_stats["resolved_by"] = "proxy" if _proxy else "direct"
+                                    _done = True
+                                    break  # Success — exit proxy loop
+
+                            except Exception as _crawl_err:
+                                _crawl_stats["proxies_used"].append({
+                                    "proxy": _proxy.server if _proxy else None,
+                                    "status_code": None,
+                                    "blocked": True,
+                                    "reason": str(_crawl_err),
+                                })
+                                self.logger.error_status(
+                                    url=url,
+                                    error=f"Proxy {_proxy.server if _proxy else 'direct'} failed: {_crawl_err}",
+                                    tag="ANTIBOT",
+                                )
+                                _block_reason = str(_crawl_err)
+                                # If this is the only proxy and only attempt, re-raise
+                                # so the caller gets the real error (not a silent swallow).
+                                # But if there are more proxies or retries to try, continue.
+                                if len(_proxy_list) <= 1 and _max_attempts <= 1:
+                                    raise
+
+                    # Restore original proxy_config
+                    config.proxy_config = _original_proxy_config
+
+                    # --- Fallback fetch function (last resort after all retries+proxies exhausted) ---
+                    # Invoke fallback when: (a) crawl_result exists but is blocked, OR
+                    # (b) crawl_result is None because all proxies threw exceptions (browser crash, timeout).
+                    # Skip for raw: URLs — fallback expects a real URL, not raw HTML content.
+                    _fallback_fn = getattr(config, "fallback_fetch_function", None)
+                    if _fallback_fn and not _done and not _is_raw_url:
+                        _needs_fallback = (
+                            crawl_result is None  # All proxies threw exceptions
+                            or is_blocked(crawl_result.status_code, crawl_result.html or "")[0]
+                        )
+                        if _needs_fallback:
+                            self.logger.warning(
+                                message="All retries exhausted, invoking fallback_fetch_function for {url}",
+                                tag="ANTIBOT",
+                                params={"url": url[:80]},
+                            )
+                            _crawl_stats["fallback_fetch_used"] = True
+                            try:
+                                _fallback_html = await _fallback_fn(url)
+                                if _fallback_html:
+                                    _sanitized_html = sanitize_input_encode(_fallback_html)
+                                    try:
+                                        crawl_result = await self.aprocess_html(
+                                            url=url,
+                                            html=_sanitized_html,
+                                            extracted_content=extracted_content,
+                                            config=config,
+                                            screenshot_data=None,
+                                            pdf_data=None,
+                                            verbose=config.verbose,
+                                            is_raw_html=True,
+                                            redirected_url=url,
+                                            original_scheme=urlparse(url).scheme,
+                                            **kwargs,
+                                        )
+                                    except Exception as _proc_err:
+                                        # aprocess_html may fail if browser is dead (e.g.,
+                                        # consent popup removal needs Page.evaluate).
+                                        # Fall back to a minimal result with raw HTML.
+                                        self.logger.warning(
+                                            message="Fallback HTML processing failed ({err}), using raw HTML",
+                                            tag="ANTIBOT",
+                                            params={"err": str(_proc_err)[:100]},
+                                        )
+                                        crawl_result = CrawlResult(
+                                            url=url,
+                                            html=_sanitized_html,
+                                            success=True,
+                                            status_code=200,
+                                        )
+                                    crawl_result.success = True
+                                    crawl_result.status_code = 200
+                                    crawl_result.session_id = getattr(config, "session_id", None)
+                                    crawl_result.cache_status = "miss"
+                                    _crawl_stats["resolved_by"] = "fallback_fetch"
+                            except Exception as _fallback_err:
+                                self.logger.error_status(
+                                    url=url,
+                                    error=f"Fallback fetch failed: {_fallback_err}",
+                                    tag="ANTIBOT",
+                                )
+
+                    # --- Mark blocked results as failed ---
+                    # Skip re-check ONLY when fallback SUCCEEDED — the fallback result
+                    # is authoritative and real pages may contain anti-bot script markers
+                    # (e.g. PerimeterX JS on Walmart) that trigger false positives.
+                    # When fallback was attempted but FAILED, we must still re-check
+                    # because the result is from a blocked proxy attempt.
+                    # Also skip for raw: URLs — caller-provided content, anti-bot N/A.
+                    if crawl_result:
+                        _fallback_succeeded = _crawl_stats.get("resolved_by") == "fallback_fetch"
+                        if not _fallback_succeeded and not _is_raw_url:
+                            _blocked, _block_reason = is_blocked(
+                                crawl_result.status_code, crawl_result.html or "")
+                            if _blocked:
+                                if config.verbose:
+                                    self.logger.info(
+                                        message="Anti-bot blocked: reason={reason}, status={status}, url={url}",
+                                        tag="ANTIBOT",
+                                        params={"reason": _block_reason, "status": crawl_result.status_code, "url": url[:80]},
+                                    )
+                                crawl_result.success = False
+                                crawl_result.error_message = f"Blocked by anti-bot protection: {_block_reason}"
+                        crawl_result.crawl_stats = _crawl_stats
+                    else:
+                        # All proxies threw exceptions and fallback either wasn't
+                        # configured or also failed.  Build a minimal result so the
+                        # caller gets crawl_stats instead of None.
+                        crawl_result = CrawlResult(
+                            url=url,
+                            html="",
+                            success=False,
+                            status_code=None,
+                            error_message=f"All proxies failed: {_block_reason}" if _block_reason else "All proxies failed",
+                        )
+                        crawl_result.crawl_stats = _crawl_stats
+
+                    # Compute head fingerprint for cache validation
+                    if crawl_result and crawl_result.html:
+                        head_end = crawl_result.html.lower().find('</head>')
+                        if head_end != -1:
+                            head_html = crawl_result.html[:head_end + 7]
+                            crawl_result.head_fingerprint = compute_head_fingerprint(head_html)
+
                     self.logger.url_status(
                         url=cache_context.display_url,
-                        success=bool(html),
-                        timing=t2 - t1,
-                        tag="FETCH",
-                    )
-
-                    ###############################################################
-                    # Process the HTML content, Call CrawlerStrategy.process_html #
-                    ###############################################################
-                    crawl_result: CrawlResult = await self.aprocess_html(
-                        url=url,
-                        html=html,
-                        extracted_content=extracted_content,
-                        config=config,  # Pass the config object instead of individual parameters
-                        screenshot=screenshot_data,
-                        pdf_data=pdf_data,
-                        verbose=config.verbose,
-                        is_raw_html=True if url.startswith("raw:") else False,
-                        **kwargs,
-                    )
-
-                    crawl_result.status_code = async_response.status_code
-                    crawl_result.redirected_url = async_response.redirected_url or url
-                    crawl_result.response_headers = async_response.response_headers
-                    crawl_result.downloaded_files = async_response.downloaded_files
-                    crawl_result.js_execution_result = js_execution_result
-                    crawl_result.mhtml = async_response.mhtml_data
-                    crawl_result.ssl_certificate = async_response.ssl_certificate
-                    # Add captured network and console data if available
-                    crawl_result.network_requests = async_response.network_requests
-                    crawl_result.console_messages = async_response.console_messages
-
-                    crawl_result.success = bool(html)
-                    crawl_result.session_id = getattr(
-                        config, "session_id", None)
-
-                    self.logger.success(
-                        message="{url:.50}... | Status: {status} | Total: {timing}",
+                        success=crawl_result.success if crawl_result else False,
+                        timing=time.perf_counter() - start_time,
                         tag="COMPLETE",
-                        params={
-                            "url": cache_context.display_url,
-                            "status": crawl_result.success,
-                            "timing": f"{time.perf_counter() - start_time:.2f}s",
-                        },
-                        colors={
-                            "status": Fore.GREEN if crawl_result.success else Fore.RED,
-                            "timing": Fore.YELLOW,
-                        },
                     )
 
                     # Update cache if appropriate
@@ -1752,21 +2900,18 @@ class AsyncWebCrawler:
                     return CrawlResultContainer(crawl_result)
 
                 else:
-                    self.logger.success(
-                        message="{url:.50}... | Status: {status} | Total: {timing}",
-                        tag="COMPLETE",
-                        params={
-                            "url": cache_context.display_url,
-                            "status": True,
-                            "timing": f"{time.perf_counter() - start_time:.2f}s",
-                        },
-                        colors={"status": Fore.GREEN, "timing": Fore.YELLOW},
+                    self.logger.url_status(
+                        url=cache_context.display_url,
+                        success=True,
+                        timing=time.perf_counter() - start_time,
+                        tag="COMPLETE"
                     )
-
                     cached_result.success = bool(html)
                     cached_result.session_id = getattr(
                         config, "session_id", None)
-                    cached_result.redirected_url = cached_result.redirected_url or url
+                    # For raw: URLs, don't fall back to the raw HTML string as redirected_url
+                    is_raw_url = url.startswith("raw:") or url.startswith("raw://")
+                    cached_result.redirected_url = cached_result.redirected_url or (None if is_raw_url else url)
                     return CrawlResultContainer(cached_result)
 
             except Exception as e:
@@ -1781,7 +2926,7 @@ class AsyncWebCrawler:
 
                 self.logger.error_status(
                     url=url,
-                    error=create_box_message(error_message, type="error"),
+                    error=error_message,
                     tag="ERROR",
                 )
 
@@ -1797,7 +2942,7 @@ class AsyncWebCrawler:
         html: str,
         extracted_content: str,
         config: CrawlerRunConfig,
-        screenshot: str,
+        screenshot_data: str,
         pdf_data: str,
         verbose: bool,
         **kwargs,
@@ -1810,7 +2955,7 @@ class AsyncWebCrawler:
             html: Raw HTML content
             extracted_content: Previously extracted content (if any)
             config: Configuration object controlling processing behavior
-            screenshot: Screenshot data (if any)
+            screenshot_data: Screenshot data (if any)
             pdf_data: PDF data (if any)
             verbose: Whether to enable verbose logging
             **kwargs: Additional parameters for backwards compatibility
@@ -1818,6 +2963,27 @@ class AsyncWebCrawler:
         Returns:
             CrawlResult: Processed result containing extracted and formatted content
         """
+        # === PREFETCH MODE SHORT-CIRCUIT ===
+        if getattr(config, 'prefetch', False):
+            from .utils import quick_extract_links
+
+            # Use base_url from config (for raw: URLs), redirected_url, or original url
+            effective_url = getattr(config, 'base_url', None) or kwargs.get('redirected_url') or url
+            links = quick_extract_links(html, effective_url)
+
+            return CrawlResult(
+                url=url,
+                html=html,
+                success=True,
+                links=links,
+                status_code=kwargs.get('status_code'),
+                response_headers=kwargs.get('response_headers'),
+                redirected_url=kwargs.get('redirected_url'),
+                ssl_certificate=kwargs.get('ssl_certificate'),
+                # All other fields default to None
+            )
+        # === END PREFETCH SHORT-CIRCUIT ===
+
         cleaned_html = ""
         try:
             _url = url if not kwargs.get("is_raw_html", False) else "Raw HTML"
@@ -1858,13 +3024,20 @@ class AsyncWebCrawler:
             cleaned_html = sanitize_input_encode(
                 result.get("cleaned_html", ""))
             media = result.get("media", {})
+            tables = media.pop("tables", []) if isinstance(media, dict) else []
             links = result.get("links", {})
             metadata = result.get("metadata", {})
         else:
             cleaned_html = sanitize_input_encode(result.cleaned_html)
-            media = result.media.model_dump()
-            links = result.links.model_dump()
+            # media = result.media.model_dump()
+            # tables = media.pop("tables", [])
+            # links = result.links.model_dump()
+            media = result.media.model_dump() if hasattr(result.media, 'model_dump') else result.media
+            tables = media.pop("tables", []) if isinstance(media, dict) else []
+            links = result.links.model_dump() if hasattr(result.links, 'model_dump') else result.links
             metadata = result.metadata
+
+        fit_html = preprocess_html_for_schema(html_content=html, text_threshold= 500, max_size= 300_000)
 
         ################################
         # Generate Markdown            #
@@ -1881,7 +3054,7 @@ class AsyncWebCrawler:
         html_source_selector = {
             "raw_html": lambda: html,  # The original raw HTML
             "cleaned_html": lambda: cleaned_html,  # The HTML after scraping strategy
-            "fit_html": lambda: preprocess_html_for_schema(html_content=html),  # Preprocessed raw HTML
+            "fit_html": lambda: fit_html,  # The HTML after preprocessing for schema
         }
 
         markdown_input_html = cleaned_html  # Default to cleaned_html
@@ -1912,23 +3085,33 @@ class AsyncWebCrawler:
         # if not config.content_filter and not markdown_generator.content_filter:
         #     markdown_generator.content_filter = PruningContentFilter()
 
+        # Extract <base href> from raw HTML before it gets stripped by cleaning.
+        # This ensures relative URLs resolve correctly even with cleaned_html.
+        base_url = params.get("base_url") or params.get("redirected_url") or url
+        base_tag_match = re.search(r'<base\s[^>]*href\s*=\s*["\']([^"\']+)["\']', html, re.IGNORECASE)
+        if base_tag_match:
+            base_url = base_tag_match.group(1)
+
         markdown_result: MarkdownGenerationResult = (
             markdown_generator.generate_markdown(
                 input_html=markdown_input_html,
-                base_url=url,
+                base_url=base_url
                 # html2text_options=kwargs.get('html2text', {})
             )
         )
 
         # Log processing completion
-        self.logger.info(
-            message="{url:.50}... | Time: {timing}s",
-            tag="SCRAPE",
-            params={
-                "url": _url,
-                "timing": int((time.perf_counter() - t1) * 1000) / 1000,
-            },
+        self.logger.url_status(
+            url=_url,
+            success=True,
+            timing=int((time.perf_counter() - t1) * 1000) / 1000,
+            tag="SCRAPE"
         )
+        # self.logger.info(
+        #     message="{url:.50}... | Time: {timing}s",
+        #     tag="SCRAPE",
+        #     params={"url": _url, "timing": int((time.perf_counter() - t1) * 1000) / 1000},
+        # )
 
         ################################
         # Structured Content Extraction           #
@@ -1942,16 +3125,19 @@ class AsyncWebCrawler:
             # Choose content based on input_format
             content_format = config.extraction_strategy.input_format
             if content_format == "fit_markdown" and not markdown_result.fit_markdown:
-                self.logger.warning(
-                    message="Fit markdown requested but not available. Falling back to raw markdown.",
-                    tag="EXTRACT",
-                    params={"url": _url},
-                )
+
+                self.logger.url_status(
+                        url=_url,
+                        success=bool(html),
+                        timing=time.perf_counter() - t1,
+                        tag="EXTRACT",
+                    )
                 content_format = "markdown"
 
             content = {
                 "markdown": markdown_result.raw_markdown,
                 "html": html,
+                "fit_html": fit_html,
                 "cleaned_html": cleaned_html,
                 "fit_markdown": markdown_result.fit_markdown,
             }.get(content_format, markdown_result.raw_markdown)
@@ -1959,25 +3145,32 @@ class AsyncWebCrawler:
             # Use IdentityChunking for HTML input, otherwise use provided chunking strategy
             chunking = (
                 IdentityChunking()
-                if content_format in ["html", "cleaned_html"]
+                if content_format in ["html", "cleaned_html", "fit_html"]
                 else config.chunking_strategy
             )
             sections = chunking.chunk(content)
-            extracted_content = config.extraction_strategy.run(url, sections)
+            # extracted_content = config.extraction_strategy.run(_url, sections)
+
+            # Use async version if available for better parallelism
+            if hasattr(config.extraction_strategy, 'arun'):
+                extracted_content = await config.extraction_strategy.arun(_url, sections)
+            else:
+                # Fallback to sync version run in thread pool to avoid blocking
+                extracted_content = await asyncio.to_thread(
+                    config.extraction_strategy.run, url, sections
+                )
+                
             extracted_content = json.dumps(
                 extracted_content, indent=4, default=str, ensure_ascii=False
             )
 
             # Log extraction completion
-            self.logger.info(
-                message="Completed for {url:.50}... | Time: {timing}s",
-                tag="EXTRACT",
-                params={"url": _url, "timing": time.perf_counter() - t1},
-            )
-
-        # Handle screenshot and PDF data
-        screenshot_data = None if not screenshot else screenshot
-        pdf_data = None if not pdf_data else pdf_data
+            self.logger.url_status(
+                        url=_url,
+                        success=bool(html),
+                        timing=time.perf_counter() - t1,
+                        tag="EXTRACT",
+                    )
 
         # Apply HTML formatting if requested
         if config.prettiify:
@@ -1987,9 +3180,11 @@ class AsyncWebCrawler:
         return CrawlResult(
             url=url,
             html=html,
+            fit_html=fit_html,
             cleaned_html=cleaned_html,
             markdown=markdown_result,
             media=media,
+            tables=tables,                       # NEW
             links=links,
             metadata=metadata,
             screenshot=screenshot_data,
@@ -2002,7 +3197,7 @@ class AsyncWebCrawler:
     async def arun_many(
         self,
         urls: List[str],
-        config: Optional[CrawlerRunConfig] = None,
+        config: Optional[Union[CrawlerRunConfig, List[CrawlerRunConfig]]] = None,
         dispatcher: Optional[BaseDispatcher] = None,
         # Legacy parameters maintained for backwards compatibility
         # word_count_threshold=MIN_WORD_THRESHOLD,
@@ -2023,7 +3218,9 @@ class AsyncWebCrawler:
 
         Args:
         urls: List of URLs to crawl
-        config: Configuration object controlling crawl behavior for all URLs
+        config: Configuration object(s) controlling crawl behavior. Can be:
+            - Single CrawlerRunConfig: Used for all URLs
+            - List[CrawlerRunConfig]: Configs with url_matcher for URL-specific settings
         dispatcher: The dispatcher strategy instance to use. Defaults to MemoryAdaptiveDispatcher
         [other parameters maintained for backwards compatibility]
 
@@ -2049,25 +3246,44 @@ class AsyncWebCrawler:
             print(f"Processed {result.url}: {len(result.markdown)} chars")
         """
         config = config or CrawlerRunConfig()
-        # if config is None:
-        #     config = CrawlerRunConfig(
-        #         word_count_threshold=word_count_threshold,
-        #         extraction_strategy=extraction_strategy,
-        #         chunking_strategy=chunking_strategy,
-        #         content_filter=content_filter,
-        #         cache_mode=cache_mode,
-        #         bypass_cache=bypass_cache,
-        #         css_selector=css_selector,
-        #         screenshot=screenshot,
-        #         pdf=pdf,
-        #         verbose=verbose,
-        #         **kwargs,
-        #     )
+
+        # When deep_crawl_strategy is set, bypass the dispatcher and call
+        # arun() directly for each URL.  The DeepCrawlDecorator on arun()
+        # will invoke the strategy and return List[CrawlResult].  The
+        # dispatcher cannot handle that return type (it expects a single
+        # CrawlResult), so we must handle it here.
+        primary_cfg = config[0] if isinstance(config, list) else config
+        if getattr(primary_cfg, "deep_crawl_strategy", None):
+            if primary_cfg.stream:
+                async def _deep_crawl_stream():
+                    for url in urls:
+                        result = await self.arun(url, config=primary_cfg)
+                        if isinstance(result, list):
+                            for r in result:
+                                yield r
+                        else:
+                            async for r in result:
+                                yield r
+                return _deep_crawl_stream()
+            else:
+                all_results = []
+                for url in urls:
+                    result = await self.arun(url, config=primary_cfg)
+                    if isinstance(result, list):
+                        all_results.extend(result)
+                    else:
+                        all_results.append(result)
+                return all_results
 
         if dispatcher is None:
+            primary_cfg = config[0] if isinstance(config, list) else config
+            mean_delay = getattr(primary_cfg, "mean_delay", 0.1)
+            max_range = getattr(primary_cfg, "max_range", 0.3)
             dispatcher = MemoryAdaptiveDispatcher(
                 rate_limiter=RateLimiter(
-                    base_delay=(1.0, 3.0), max_delay=60.0, max_retries=3
+                    base_delay=(mean_delay, mean_delay + max_range),
+                    max_delay=60.0,
+                    max_retries=3,
                 ),
             )
 
@@ -2088,25 +3304,144 @@ class AsyncWebCrawler:
                 or task_result.result
             )
 
-        stream = config.stream
+        # Handle stream setting - use first config's stream setting if config is a list
+        if isinstance(config, list):
+            stream = config[0].stream if config else False
+            primary_config = config[0] if config else None
+        else:
+            stream = config.stream
+            primary_config = config
+
+        # Helper to release sticky session if auto_release is enabled
+        async def maybe_release_session():
+            if (primary_config and
+                primary_config.proxy_session_id and
+                primary_config.proxy_session_auto_release and
+                primary_config.proxy_rotation_strategy):
+                await primary_config.proxy_rotation_strategy.release_session(
+                    primary_config.proxy_session_id
+                )
+                self.logger.info(
+                    message="Auto-released proxy session: {session_id}",
+                    tag="PROXY",
+                    params={"session_id": primary_config.proxy_session_id}
+                )
 
         if stream:
-
             async def result_transformer():
-                async for task_result in dispatcher.run_urls_stream(
-                    crawler=self, urls=urls, config=config
-                ):
-                    yield transform_result(task_result)
+                try:
+                    async for task_result in dispatcher.run_urls_stream(
+                        crawler=self, urls=urls, config=config
+                    ):
+                        yield transform_result(task_result)
+                finally:
+                    # Auto-release session after streaming completes
+                    await maybe_release_session()
 
             return result_transformer()
         else:
-            _results = await dispatcher.run_urls(crawler=self, urls=urls, config=config)
-            return [transform_result(res) for res in _results]
+            try:
+                _results = await dispatcher.run_urls(crawler=self, urls=urls, config=config)
+                return [transform_result(res) for res in _results]
+            finally:
+                # Auto-release session after batch completes
+                await maybe_release_session()
 
+    async def aseed_urls(
+        self,
+        domain_or_domains: Union[str, List[str]],
+        config: Optional[SeedingConfig] = None,
+        **kwargs
+    ) -> Union[List[str], Dict[str, List[Union[str, Dict[str, Any]]]]]:
+        """
+        Discovers, filters, and optionally validates URLs for a given domain(s)
+        using sitemaps and Common Crawl archives.
+
+        Args:
+            domain_or_domains: A single domain string (e.g., "iana.org") or a list of domains.
+            config: A SeedingConfig object to control the seeding process.
+                    Parameters passed directly via kwargs will override those in 'config'.
+            **kwargs: Additional parameters (e.g., `source`, `live_check`, `extract_head`,
+                      `pattern`, `concurrency`, `hits_per_sec`, `force_refresh`, `verbose`)
+                      that will be used to construct or update the SeedingConfig.
+
+        Returns:
+            If `extract_head` is False:
+                - For a single domain: `List[str]` of discovered URLs.
+                - For multiple domains: `Dict[str, List[str]]` mapping each domain to its URLs.
+            If `extract_head` is True:
+                - For a single domain: `List[Dict[str, Any]]` where each dict contains 'url'
+                  and 'head_data' (parsed <head> metadata).
+                - For multiple domains: `Dict[str, List[Dict[str, Any]]]` mapping each domain
+                  to a list of URL data dictionaries.
+
+        Raises:
+            ValueError: If `domain_or_domains` is not a string or a list of strings.
+            Exception: Any underlying exceptions from AsyncUrlSeeder or network operations.
+
+        Example:
+            >>> # Discover URLs from sitemap with live check for 'example.com'
+            >>> result = await crawler.aseed_urls("example.com", source="sitemap", live_check=True, hits_per_sec=10)
+
+            >>> # Discover URLs from Common Crawl, extract head data for 'example.com' and 'python.org'
+            >>> multi_domain_result = await crawler.aseed_urls(
+            >>>     ["example.com", "python.org"],
+            >>>     source="cc", extract_head=True, concurrency=200, hits_per_sec=50
+            >>> )
+        """
+        # Initialize AsyncUrlSeeder here if it hasn't been already
+        if not self.url_seeder:
+            # Pass the crawler's base_directory for seeder's cache management
+            # Pass the crawler's logger for consistent logging
+            self.url_seeder = AsyncUrlSeeder(
+                base_directory=self.crawl4ai_folder,
+                logger=self.logger
+            )                    
+
+        # Merge config object with direct kwargs, giving kwargs precedence
+        seeding_config = config.clone(**kwargs) if config else SeedingConfig.from_kwargs(kwargs)
+        
+        # Ensure base_directory is set for the seeder's cache
+        seeding_config.base_directory = seeding_config.base_directory or self.crawl4ai_folder        
+        # Ensure the seeder uses the crawler's logger (if not already set)
+        if not self.url_seeder.logger:
+            self.url_seeder.logger = self.logger
+
+        # Pass verbose setting if explicitly provided in SeedingConfig or kwargs
+        if seeding_config.verbose is not None:
+            self.url_seeder.logger.verbose = seeding_config.verbose
+        else: # Default to crawler's verbose setting
+            self.url_seeder.logger.verbose = self.logger.verbose
+
+
+        if isinstance(domain_or_domains, str):
+            self.logger.info(
+                message="Starting URL seeding for domain: {domain}",
+                tag="SEED",
+                params={"domain": domain_or_domains}
+            )
+            return await self.url_seeder.urls(
+                domain_or_domains,
+                seeding_config
+            )
+        elif isinstance(domain_or_domains, (list, tuple)):
+            self.logger.info(
+                message="Starting URL seeding for {count} domains",
+                tag="SEED",
+                params={"count": len(domain_or_domains)}
+            )
+            # AsyncUrlSeeder.many_urls directly accepts a list of domains and individual params.
+            return await self.url_seeder.many_urls(
+                domain_or_domains,
+                seeding_config
+            )
+        else:
+            raise ValueError("`domain_or_domains` must be a string or a list of strings.")
 ```
 
 
 ## File: crawl4ai/cli.py
+
 
 ```py
 import click
@@ -2126,21 +3461,26 @@ from rich.prompt import Prompt, Confirm
 
 from crawl4ai import (
     CacheMode,
-    AsyncWebCrawler, 
+    AsyncWebCrawler,
     CrawlResult,
-    BrowserConfig, 
+    BrowserConfig,
     CrawlerRunConfig,
-    LLMExtractionStrategy, 
+    LLMExtractionStrategy,
     LXMLWebScrapingStrategy,
     JsonCssExtractionStrategy,
     JsonXPathExtractionStrategy,
-    BM25ContentFilter, 
+    BM25ContentFilter,
     PruningContentFilter,
     BrowserProfiler,
     DefaultMarkdownGenerator,
-    LLMConfig
+    LLMConfig,
+    BFSDeepCrawlStrategy,
+    DFSDeepCrawlStrategy,
+    BestFirstCrawlingStrategy,
 )
+from crawl4ai.browser_profiler import ShrinkLevel, _format_size
 from crawl4ai.config import USER_SETTINGS
+from crawl4ai.cloud import cloud_cmd
 from litellm import completion
 from pathlib import Path
 
@@ -2161,7 +3501,7 @@ def get_global_config() -> dict:
 
 def save_global_config(config: dict):
     config_file = Path.home() / ".crawl4ai" / "global.yml"
-    with open(config_file, "w") as f:
+    with open(config_file, "w", encoding="utf-8") as f:
         yaml.dump(config, f)
 
 def setup_llm_config() -> tuple[str, str]:
@@ -2629,11 +3969,15 @@ async def crawl_with_profile_cli(profile_path, url):
         # Run the crawler
         result = await run_crawler(url, browser_cfg, crawler_cfg, True)
         
+        # Get JSON output config
+        config = get_global_config()
+        ensure_ascii = config.get("JSON_ENSURE_ASCII", USER_SETTINGS["JSON_ENSURE_ASCII"]["default"])
+
         # Handle output
         if output_format == "all":
-            console.print(json.dumps(result.model_dump(), indent=2))
+            console.print(json.dumps(result.model_dump(), indent=2, ensure_ascii=ensure_ascii))
         elif output_format == "json":
-            console.print(json.dumps(json.loads(result.extracted_content), indent=2))
+            console.print(json.dumps(json.loads(result.extracted_content), indent=2, ensure_ascii=ensure_ascii))
         elif output_format in ["markdown", "md"]:
             console.print(result.markdown.raw_markdown)
         elif output_format == "title":
@@ -2731,6 +4075,9 @@ async def manage_profiles():
 def cli():
     """Crawl4AI CLI - Web content extraction and browser profile management tool"""
     pass
+
+# Add cloud command group
+cli.add_command(cloud_cmd)
 
 
 @cli.group("browser")
@@ -3121,15 +4468,18 @@ def cdp_cmd(user_data_dir: Optional[str], port: int, browser_type: str, headless
 @click.option("--crawler", "-c", type=str, callback=parse_key_values, help="Crawler parameters as key1=value1,key2=value2")
 @click.option("--output", "-o", type=click.Choice(["all", "json", "markdown", "md", "markdown-fit", "md-fit"]), default="all")
 @click.option("--output-file", "-O", type=click.Path(), help="Output file path (default: stdout)")
-@click.option("--bypass-cache", "-b", is_flag=True, default=True, help="Bypass cache when crawling")
+@click.option("--bypass-cache", "-bc", is_flag=True, default=True, help="Bypass cache when crawling")
 @click.option("--question", "-q", help="Ask a question about the crawled content")
 @click.option("--verbose", "-v", is_flag=True)
 @click.option("--profile", "-p", help="Use a specific browser profile (by name)")
-def crawl_cmd(url: str, browser_config: str, crawler_config: str, filter_config: str, 
+@click.option("--deep-crawl", type=click.Choice(["bfs", "dfs", "best-first"]), help="Enable deep crawling with specified strategy (bfs, dfs, or best-first)")
+@click.option("--max-pages", type=int, default=10, help="Maximum number of pages to crawl in deep crawl mode")
+@click.option("--json-ensure-ascii/--no-json-ensure-ascii", default=None, help="Escape non-ASCII characters in JSON output (default: from global config)")
+def crawl_cmd(url: str, browser_config: str, crawler_config: str, filter_config: str,
            extraction_config: str, json_extract: str, schema: str, browser: Dict, crawler: Dict,
-           output: str, output_file: str, bypass_cache: bool, question: str, verbose: bool, profile: str):
+           output: str, output_file: str, bypass_cache: bool, question: str, verbose: bool, profile: str, deep_crawl: str, max_pages: int, json_ensure_ascii: Optional[bool]):
     """Crawl a website and extract content
-    
+
     Simple Usage:
         crwl crawl https://example.com
     """
@@ -3184,7 +4534,8 @@ def crawl_cmd(url: str, browser_config: str, crawler_config: str, filter_config:
                 crawler_cfg.markdown_generator = DefaultMarkdownGenerator(
                     content_filter = BM25ContentFilter(
                         user_query=filter_conf.get("query"),
-                        bm25_threshold=filter_conf.get("threshold", 1.0)
+                        bm25_threshold=filter_conf.get("threshold", 1.0),
+                        use_stemming=filter_conf.get("use_stemming", True),
                     )
                 )
             elif filter_conf["type"] == "pruning":
@@ -3266,11 +4617,42 @@ Always return valid, properly formatted JSON."""
 
         crawler_cfg.scraping_strategy = LXMLWebScrapingStrategy()    
 
+        # Handle deep crawling configuration
+        if deep_crawl:
+            if deep_crawl == "bfs":
+                crawler_cfg.deep_crawl_strategy = BFSDeepCrawlStrategy(
+                    max_depth=3,
+                    max_pages=max_pages
+                )
+            elif deep_crawl == "dfs":
+                crawler_cfg.deep_crawl_strategy = DFSDeepCrawlStrategy(
+                    max_depth=3,
+                    max_pages=max_pages
+                )
+            elif deep_crawl == "best-first":
+                crawler_cfg.deep_crawl_strategy = BestFirstCrawlingStrategy(
+                    max_depth=3,
+                    max_pages=max_pages
+                )
+            
+            if verbose:
+                console.print(f"[green]Deep crawling enabled:[/green] {deep_crawl} strategy, max {max_pages} pages")
+
         config = get_global_config()
-        
-        browser_cfg.verbose = config.get("VERBOSE", False)
-        crawler_cfg.verbose = config.get("VERBOSE", False)
-        
+
+        # Priority: CLI --verbose flag > global config > default (False)
+        global_verbose = config.get("VERBOSE", False)
+        effective_verbose = verbose if verbose else global_verbose
+
+        browser_cfg.verbose = effective_verbose
+        crawler_cfg.verbose = effective_verbose
+
+        # Get JSON output config (priority: CLI flag > global config)
+        if json_ensure_ascii is not None:
+            ensure_ascii = json_ensure_ascii
+        else:
+            ensure_ascii = config.get("JSON_ENSURE_ASCII", USER_SETTINGS["JSON_ENSURE_ASCII"]["default"])
+
         # Run crawler
         result : CrawlResult = anyio.run(
             run_crawler,
@@ -3280,39 +4662,84 @@ Always return valid, properly formatted JSON."""
             verbose
         )
 
+        # Handle deep crawl results (list) vs single result
+        if isinstance(result, list):
+            if len(result) == 0:
+                click.echo("No results found during deep crawling")
+                return
+            # Use the first result for question answering and output
+            main_result = result[0]
+            all_results = result
+        else:
+            # Single result from regular crawling
+            main_result = result
+            all_results = [result]
+
         # Handle question
         if question:
             provider, token = setup_llm_config()
-            markdown = result.markdown.raw_markdown
+            markdown = main_result.markdown.raw_markdown
             anyio.run(stream_llm_response, url, markdown, question, provider, token)
             return
         
         # Handle output
         if not output_file:
             if output == "all":
-                click.echo(json.dumps(result.model_dump(), indent=2))
+                if isinstance(result, list):
+                    output_data = [r.model_dump() for r in all_results]
+                    click.echo(json.dumps(output_data, indent=2, ensure_ascii=ensure_ascii))
+                else:
+                    click.echo(json.dumps(main_result.model_dump(), indent=2, ensure_ascii=ensure_ascii))
             elif output == "json":
-                print(result.extracted_content)
-                extracted_items = json.loads(result.extracted_content)
-                click.echo(json.dumps(extracted_items, indent=2))
-                
+                print(main_result.extracted_content)
+                extracted_items = json.loads(main_result.extracted_content)
+                click.echo(json.dumps(extracted_items, indent=2, ensure_ascii=ensure_ascii))
+
             elif output in ["markdown", "md"]:
-                click.echo(result.markdown.raw_markdown)
+                if isinstance(result, list):
+                    # Combine markdown from all crawled pages for deep crawl
+                    for r in all_results:
+                        click.echo(f"\n\n{'='*60}\n# {r.url}\n{'='*60}\n\n")
+                        click.echo(r.markdown.raw_markdown)
+                else:
+                    click.echo(main_result.markdown.raw_markdown)
             elif output in ["markdown-fit", "md-fit"]:
-                click.echo(result.markdown.fit_markdown)
+                if isinstance(result, list):
+                    # Combine fit markdown from all crawled pages for deep crawl
+                    for r in all_results:
+                        click.echo(f"\n\n{'='*60}\n# {r.url}\n{'='*60}\n\n")
+                        click.echo(r.markdown.fit_markdown)
+                else:
+                    click.echo(main_result.markdown.fit_markdown)
         else:
             if output == "all":
-                with open(output_file, "w") as f:
-                    f.write(json.dumps(result.model_dump(), indent=2))
+                with open(output_file, "w", encoding="utf-8") as f:
+                    if isinstance(result, list):
+                        output_data = [r.model_dump() for r in all_results]
+                        f.write(json.dumps(output_data, indent=2, ensure_ascii=ensure_ascii))
+                    else:
+                        f.write(json.dumps(main_result.model_dump(), indent=2, ensure_ascii=ensure_ascii))
             elif output == "json":
-                with open(output_file, "w") as f:
-                    f.write(result.extracted_content)
+                with open(output_file, "w", encoding="utf-8") as f:
+                    f.write(main_result.extracted_content)
             elif output in ["markdown", "md"]:
-                with open(output_file, "w") as f:
-                    f.write(result.markdown.raw_markdown)
+                with open(output_file, "w", encoding="utf-8") as f:
+                    if isinstance(result, list):
+                        # Combine markdown from all crawled pages for deep crawl
+                        for r in all_results:
+                            f.write(f"\n\n{'='*60}\n# {r.url}\n{'='*60}\n\n")
+                            f.write(r.markdown.raw_markdown)
+                    else:
+                        f.write(main_result.markdown.raw_markdown)
             elif output in ["markdown-fit", "md-fit"]:
-                with open(output_file, "w") as f:
-                    f.write(result.markdown.fit_markdown)
+                with open(output_file, "w", encoding="utf-8") as f:
+                    if isinstance(result, list):
+                        # Combine fit markdown from all crawled pages for deep crawl
+                        for r in all_results:
+                            f.write(f"\n\n{'='*60}\n# {r.url}\n{'='*60}\n\n")
+                            f.write(r.markdown.fit_markdown)
+                    else:
+                        f.write(main_result.markdown.fit_markdown)
             
     except Exception as e:
         raise click.ClickException(str(e))
@@ -3436,17 +4863,159 @@ def config_set_cmd(key: str, value: str):
         
     console.print(f"[green]Successfully set[/green] [cyan]{key}[/cyan] = [green]{display_value}[/green]")
 
-@cli.command("profiles")
-def profiles_cmd():
-    """Manage browser profiles interactively
-    
+@cli.group("profiles", invoke_without_command=True)
+@click.pass_context
+def profiles_cmd(ctx):
+    """Manage browser profiles for authenticated crawling
+
     Launch an interactive browser profile manager where you can:
     - List all existing profiles
     - Create new profiles for authenticated browsing
     - Delete unused profiles
+
+    Subcommands:
+      crwl profiles create <name>  - Create a new profile
+      crwl profiles list           - List all profiles
+      crwl profiles delete <name>  - Delete a profile
+
+    Or run without subcommand for interactive menu:
+      crwl profiles
     """
-    # Run interactive profile manager
-    anyio.run(manage_profiles)
+    # If no subcommand provided, run interactive manager
+    if ctx.invoked_subcommand is None:
+        anyio.run(manage_profiles)
+
+
+@profiles_cmd.command("create")
+@click.argument("name")
+def profiles_create_cmd(name: str):
+    """Create a new browser profile
+
+    Opens a browser window for you to log in and set up your identity.
+    Press 'q' in the terminal when finished to save the profile.
+
+    Example:
+      crwl profiles create github-auth
+    """
+    profiler = BrowserProfiler()
+    console.print(Panel(f"[bold cyan]Creating Profile: {name}[/bold cyan]\n"
+                      "A browser window will open for you to set up your identity.\n"
+                      "Log in to sites, adjust settings, then press 'q' to save.",
+                      border_style="cyan"))
+
+    async def _create():
+        try:
+            profile_path = await profiler.create_profile(name)
+            if profile_path:
+                console.print(f"[green]Profile successfully created at:[/green] {profile_path}")
+            else:
+                console.print("[red]Failed to create profile.[/red]")
+                sys.exit(1)
+        except Exception as e:
+            console.print(f"[red]Error creating profile: {str(e)}[/red]")
+            sys.exit(1)
+
+    anyio.run(_create)
+
+
+@profiles_cmd.command("list")
+def profiles_list_cmd():
+    """List all browser profiles
+
+    Example:
+      crwl profiles list
+    """
+    profiler = BrowserProfiler()
+    profiles = profiler.list_profiles()
+    display_profiles_table(profiles)
+
+
+@profiles_cmd.command("delete")
+@click.argument("name")
+@click.option("--force", "-f", is_flag=True, help="Skip confirmation")
+def profiles_delete_cmd(name: str, force: bool):
+    """Delete a browser profile
+
+    Example:
+      crwl profiles delete old-profile
+      crwl profiles delete old-profile --force
+    """
+    profiler = BrowserProfiler()
+
+    # Find profile by name
+    profiles = profiler.list_profiles()
+    profile = next((p for p in profiles if p["name"] == name), None)
+
+    if not profile:
+        console.print(f"[red]Profile not found:[/red] {name}")
+        sys.exit(1)
+
+    if not force:
+        if not Confirm.ask(f"[yellow]Delete profile '{name}'?[/yellow]"):
+            console.print("[cyan]Cancelled.[/cyan]")
+            return
+
+    try:
+        profiler.delete_profile(name)
+        console.print(f"[green]Profile '{name}' deleted successfully.[/green]")
+    except Exception as e:
+        console.print(f"[red]Error deleting profile: {str(e)}[/red]")
+        sys.exit(1)
+
+
+@cli.command("shrink")
+@click.argument("profile_name")
+@click.option(
+    "--level", "-l",
+    type=click.Choice(["light", "medium", "aggressive", "minimal"]),
+    default="aggressive",
+    help="Shrink level (default: aggressive)"
+)
+@click.option("--dry-run", "-n", is_flag=True, help="Preview without removing files")
+def shrink_cmd(profile_name: str, level: str, dry_run: bool):
+    """Shrink a browser profile to reduce storage.
+
+    Removes cache, history, and other non-essential data while preserving
+    authentication (cookies, localStorage, IndexedDB).
+
+    Shrink levels:
+      light      - Remove caches only
+      medium     - Remove caches + history
+      aggressive - Keep only auth data (recommended)
+      minimal    - Keep only cookies + localStorage
+
+    Examples:
+      crwl shrink my_profile
+      crwl shrink my_profile --level minimal
+      crwl shrink my_profile --dry-run
+    """
+    profiler = BrowserProfiler()
+
+    try:
+        result = profiler.shrink(profile_name, ShrinkLevel(level), dry_run)
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    # Display results
+    action = "Would remove" if dry_run else "Removed"
+    console.print(f"\n[cyan]Shrink Results ({level.upper()}):[/cyan]")
+    console.print(f"  {action}: {len(result['removed'])} items")
+    console.print(f"  Kept: {len(result['kept'])} items")
+    console.print(f"  Space freed: {_format_size(result['bytes_freed'])}")
+
+    if result.get("size_before"):
+        console.print(f"  Size before: {_format_size(result['size_before'])}")
+    if result.get("size_after"):
+        console.print(f"  Size after: {_format_size(result['size_after'])}")
+
+    if result["errors"]:
+        console.print(f"\n[red]Errors ({len(result['errors'])}):[/red]")
+        for err in result["errors"]:
+            console.print(f"  - {err}")
+
+    if dry_run:
+        console.print("\n[yellow]Dry run - no files were actually removed.[/yellow]")
 
 @cli.command(name="")
 @click.argument("url", required=False)
@@ -3464,9 +5033,12 @@ def profiles_cmd():
 @click.option("--question", "-q", help="Ask a question about the crawled content")
 @click.option("--verbose", "-v", is_flag=True)
 @click.option("--profile", "-p", help="Use a specific browser profile (by name)")
-def default(url: str, example: bool, browser_config: str, crawler_config: str, filter_config: str, 
+@click.option("--deep-crawl", type=click.Choice(["bfs", "dfs", "best-first"]), help="Enable deep crawling with specified strategy")
+@click.option("--max-pages", type=int, default=10, help="Maximum number of pages to crawl in deep crawl mode")
+@click.option("--json-ensure-ascii/--no-json-ensure-ascii", default=None, help="Escape non-ASCII characters in JSON output (default: from global config)")
+def default(url: str, example: bool, browser_config: str, crawler_config: str, filter_config: str,
         extraction_config: str, json_extract: str, schema: str, browser: Dict, crawler: Dict,
-        output: str, bypass_cache: bool, question: str, verbose: bool, profile: str):
+        output: str, bypass_cache: bool, question: str, verbose: bool, profile: str, deep_crawl: str, max_pages: int, json_ensure_ascii: Optional[bool]):
     """Crawl4AI CLI - Web content extraction tool
 
     Simple Usage:
@@ -3516,7 +5088,10 @@ def default(url: str, example: bool, browser_config: str, crawler_config: str, f
         bypass_cache=bypass_cache,
         question=question,
         verbose=verbose,
-        profile=profile
+        profile=profile,
+        deep_crawl=deep_crawl,
+        max_pages=max_pages,
+        json_ensure_ascii=json_ensure_ascii
     )
 
 def main():
@@ -3532,13 +5107,16 @@ if __name__ == "__main__":
 
 ## File: crawl4ai/extraction_strategy.py
 
+
 ```py
 from abc import ABC, abstractmethod
+import ast
 import inspect
-from typing import Any, List, Dict, Optional
+from typing import Any, List, Dict, Optional, Tuple, Pattern, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import time
+from enum import IntFlag, auto
 
 from .prompts import PROMPT_EXTRACT_BLOCKS, PROMPT_EXTRACT_BLOCKS_WITH_INSTRUCTION, PROMPT_EXTRACT_SCHEMA_WITH_INSTRUCTION, JSON_SCHEMA_BUILDER_XPATH, PROMPT_EXTRACT_INFERRED_SCHEMA
 from .config import (
@@ -3547,6 +5125,7 @@ from .config import (
     CHUNK_TOKEN_THRESHOLD,
     OVERLAP_RATE,
     WORD_TOKEN_RATE,
+    HTML_EXAMPLE_DELIMITER,
 )
 from .utils import *  # noqa: F403
 
@@ -3578,6 +5157,42 @@ import numpy as np
 import re
 from bs4 import BeautifulSoup
 from lxml import html, etree
+
+
+def _strip_markdown_fences(text: str) -> str:
+    """Strip markdown code fences (e.g. ```json ... ```) from LLM responses."""
+    text = text.strip()
+    return re.sub(
+        r"^```(?:[a-zA-Z0-9_-]+)?\s*|```$", "", text, flags=re.MULTILINE
+    ).strip()
+
+
+def _get_top_level_structure(html_content: str, max_depth: int = 3) -> str:
+    """Return a compact tag outline of the HTML body up to a given depth.
+
+    Used in schema validation feedback when baseSelector matches 0 elements,
+    so the LLM can see what top-level tags actually exist.
+    """
+    try:
+        tree = html.fromstring(html_content)
+    except Exception:
+        return ""
+    body = tree.xpath("//body")
+    root = body[0] if body else tree
+    lines = []
+
+    def _walk(el, depth):
+        if depth > max_depth or not isinstance(el.tag, str):
+            return
+        classes = el.get("class", "").split()
+        cls_str = "." + ".".join(classes) if classes else ""
+        id_str = f"#{el.get('id')}" if el.get("id") else ""
+        lines.append("  " * depth + f"<{el.tag}{id_str}{cls_str}>")
+        for child in el:
+            _walk(child, depth + 1)
+
+    _walk(root, 0)
+    return "\n".join(lines[:60])
 
 
 class ExtractionStrategy(ABC):
@@ -3627,6 +5242,20 @@ class ExtractionStrategy(ABC):
             for future in as_completed(futures):
                 extracted_content.extend(future.result())
         return extracted_content
+
+    async def arun(self, url: str, sections: List[str], *q, **kwargs) -> List[Dict[str, Any]]:
+        """
+        Async version: Process sections of text in parallel using asyncio.
+
+        Default implementation runs the sync version in a thread pool.
+        Subclasses can override this for true async processing.
+
+        :param url: The URL of the webpage.
+        :param sections: List of sections (strings) to process.
+        :return: A list of processed JSON blocks.
+        """
+        import asyncio
+        return await asyncio.to_thread(self.run, url, sections, *q, **kwargs)
 
 
 class NoExtractionStrategy(ExtractionStrategy):
@@ -3778,7 +5407,7 @@ class CosineStrategy(ExtractionStrategy):
             return documents
 
         if len(documents) < at_least_k:
-            at_least_k = len(documents) // 2
+            at_least_k = max(1, len(documents) // 2)
 
         from sklearn.metrics.pairwise import cosine_similarity
 
@@ -3933,7 +5562,10 @@ class CosineStrategy(ExtractionStrategy):
         """
         # Assume `html` is a list of text chunks for this strategy
         t = time.time()
-        text_chunks = html.split(self.DEL)  # Split by lines or paragraphs as needed
+        # Split by delimiter; fall back to double-newline splitting for raw text
+        text_chunks = html.split(self.DEL)
+        if len(text_chunks) == 1:
+            text_chunks = [chunk.strip() for chunk in html.split("\n\n") if chunk.strip()]
 
         # Pre-filter documents using embeddings and semantic_filter
         text_chunks = self.filter_documents_embeddings(
@@ -4169,6 +5801,9 @@ class LLMExtractionStrategy(ExtractionStrategy):
                 base_url=self.llm_config.base_url,
                 json_response=self.force_json_response,
                 extra_args=self.extra_args,
+                base_delay=self.llm_config.backoff_base_delay,
+                max_attempts=self.llm_config.backoff_max_attempts,
+                exponential_factor=self.llm_config.backoff_exponential_factor
             )  # , json_response=self.extract_type == "schema")
             # Track usage
             usage = TokenUsage(
@@ -4190,11 +5825,15 @@ class LLMExtractionStrategy(ExtractionStrategy):
             self.total_usage.total_tokens += usage.total_tokens
 
             try:
-                response = response.choices[0].message.content
+                content = response.choices[0].message.content
                 blocks = None
 
-                if self.force_json_response:
-                    blocks = json.loads(response)
+                if not content:
+                    finish_reason = getattr(response.choices[0], "finish_reason", "unknown")
+                    blocks = [{"index": 0, "error": True, "tags": ["error"],
+                               "content": f"LLM returned no content (finish_reason: {finish_reason})"}]
+                elif self.force_json_response:
+                    blocks = json.loads(_strip_markdown_fences(content))
                     if isinstance(blocks, dict):
                         # If it has only one key which calue is list then assign that to blocks, exampled: {"news": [..]}
                         if len(blocks) == 1 and isinstance(list(blocks.values())[0], list):
@@ -4207,15 +5846,14 @@ class LLMExtractionStrategy(ExtractionStrategy):
                         blocks = blocks
                 else: 
                     # blocks = extract_xml_data(["blocks"], response.choices[0].message.content)["blocks"]
-                    blocks = extract_xml_data(["blocks"], response)["blocks"]
+                    blocks = extract_xml_data(["blocks"], content)["blocks"]
                     blocks = json.loads(blocks)
 
                 for block in blocks:
                     block["error"] = False
             except Exception:
-                parsed, unparsed = split_and_parse_json_objects(
-                    response.choices[0].message.content
-                )
+                raw_content = response.choices[0].message.content or ""
+                parsed, unparsed = split_and_parse_json_objects(raw_content)
                 blocks = parsed
                 if unparsed:
                     blocks.append(
@@ -4314,6 +5952,183 @@ class LLMExtractionStrategy(ExtractionStrategy):
 
         return extracted_content
 
+    async def aextract(self, url: str, ix: int, html: str) -> List[Dict[str, Any]]:
+        """
+        Async version: Extract meaningful blocks or chunks from the given HTML using an LLM.
+
+        How it works:
+        1. Construct a prompt with variables.
+        2. Make an async request to the LLM using the prompt.
+        3. Parse the response and extract blocks or chunks.
+
+        Args:
+            url: The URL of the webpage.
+            ix: Index of the block.
+            html: The HTML content of the webpage.
+
+        Returns:
+            A list of extracted blocks or chunks.
+        """
+        from .utils import aperform_completion_with_backoff
+
+        if self.verbose:
+            print(f"[LOG] Call LLM for {url} - block index: {ix}")
+
+        variable_values = {
+            "URL": url,
+            "HTML": escape_json_string(sanitize_html(html)),
+        }
+
+        prompt_with_variables = PROMPT_EXTRACT_BLOCKS
+        if self.instruction:
+            variable_values["REQUEST"] = self.instruction
+            prompt_with_variables = PROMPT_EXTRACT_BLOCKS_WITH_INSTRUCTION
+
+        if self.extract_type == "schema" and self.schema:
+            variable_values["SCHEMA"] = json.dumps(self.schema, indent=2)
+            prompt_with_variables = PROMPT_EXTRACT_SCHEMA_WITH_INSTRUCTION
+
+        if self.extract_type == "schema" and not self.schema:
+            prompt_with_variables = PROMPT_EXTRACT_INFERRED_SCHEMA
+
+        for variable in variable_values:
+            prompt_with_variables = prompt_with_variables.replace(
+                "{" + variable + "}", variable_values[variable]
+            )
+
+        try:
+            response = await aperform_completion_with_backoff(
+                self.llm_config.provider,
+                prompt_with_variables,
+                self.llm_config.api_token,
+                base_url=self.llm_config.base_url,
+                json_response=self.force_json_response,
+                extra_args=self.extra_args,
+                base_delay=self.llm_config.backoff_base_delay,
+                max_attempts=self.llm_config.backoff_max_attempts,
+                exponential_factor=self.llm_config.backoff_exponential_factor
+            )
+            # Track usage
+            usage = TokenUsage(
+                completion_tokens=response.usage.completion_tokens,
+                prompt_tokens=response.usage.prompt_tokens,
+                total_tokens=response.usage.total_tokens,
+                completion_tokens_details=response.usage.completion_tokens_details.__dict__
+                if response.usage.completion_tokens_details
+                else {},
+                prompt_tokens_details=response.usage.prompt_tokens_details.__dict__
+                if response.usage.prompt_tokens_details
+                else {},
+            )
+            self.usages.append(usage)
+
+            # Update totals
+            self.total_usage.completion_tokens += usage.completion_tokens
+            self.total_usage.prompt_tokens += usage.prompt_tokens
+            self.total_usage.total_tokens += usage.total_tokens
+
+            try:
+                content = response.choices[0].message.content
+                blocks = None
+
+                if not content:
+                    finish_reason = getattr(response.choices[0], "finish_reason", "unknown")
+                    blocks = [{"index": 0, "error": True, "tags": ["error"],
+                               "content": f"LLM returned no content (finish_reason: {finish_reason})"}]
+                elif self.force_json_response:
+                    blocks = json.loads(_strip_markdown_fences(content))
+                    if isinstance(blocks, dict):
+                        if len(blocks) == 1 and isinstance(list(blocks.values())[0], list):
+                            blocks = list(blocks.values())[0]
+                        else:
+                            blocks = [blocks]
+                    elif isinstance(blocks, list):
+                        blocks = blocks
+                else:
+                    blocks = extract_xml_data(["blocks"], content)["blocks"]
+                    blocks = json.loads(blocks)
+
+                for block in blocks:
+                    block["error"] = False
+            except Exception:
+                raw_content = response.choices[0].message.content or ""
+                parsed, unparsed = split_and_parse_json_objects(raw_content)
+                blocks = parsed
+                if unparsed:
+                    blocks.append(
+                        {"index": 0, "error": True, "tags": ["error"], "content": unparsed}
+                    )
+
+            if self.verbose:
+                print(
+                    "[LOG] Extracted",
+                    len(blocks),
+                    "blocks from URL:",
+                    url,
+                    "block index:",
+                    ix,
+                )
+            return blocks
+        except Exception as e:
+            if self.verbose:
+                print(f"[LOG] Error in LLM extraction: {e}")
+            return [
+                {
+                    "index": ix,
+                    "error": True,
+                    "tags": ["error"],
+                    "content": str(e),
+                }
+            ]
+
+    async def arun(self, url: str, sections: List[str]) -> List[Dict[str, Any]]:
+        """
+        Async version: Process sections with true parallelism using asyncio.gather.
+
+        Args:
+            url: The URL of the webpage.
+            sections: List of sections (strings) to process.
+
+        Returns:
+            A list of extracted blocks or chunks.
+        """
+        import asyncio
+
+        merged_sections = self._merge(
+            sections,
+            self.chunk_token_threshold,
+            overlap=int(self.chunk_token_threshold * self.overlap_rate),
+        )
+
+        extracted_content = []
+
+        # Create tasks for all sections to run in parallel
+        tasks = [
+            self.aextract(url, ix, sanitize_input_encode(section))
+            for ix, section in enumerate(merged_sections)
+        ]
+
+        # Execute all tasks concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results
+        for result in results:
+            if isinstance(result, Exception):
+                if self.verbose:
+                    print(f"Error in async extraction: {result}")
+                extracted_content.append(
+                    {
+                        "index": 0,
+                        "error": True,
+                        "tags": ["error"],
+                        "content": str(result),
+                    }
+                )
+            else:
+                extracted_content.extend(result)
+
+        return extracted_content
+
     def show_usage(self) -> None:
         """Print a detailed token usage report showing total and per-request usage."""
         print("\n=== Token Usage Summary ===")
@@ -4335,6 +6150,69 @@ class LLMExtractionStrategy(ExtractionStrategy):
 #######################################################
 # New extraction strategies for JSON-based extraction #
 #######################################################
+
+# Safe builtins allowed in computed field expressions
+_SAFE_EVAL_BUILTINS = {
+    "str": str, "int": int, "float": float, "bool": bool,
+    "len": len, "round": round, "abs": abs, "min": min, "max": max,
+    "sum": sum, "sorted": sorted, "reversed": reversed,
+    "list": list, "dict": dict, "tuple": tuple, "set": set,
+    "enumerate": enumerate, "zip": zip, "map": map, "filter": filter,
+    "any": any, "all": all, "range": range,
+    "True": True, "False": False, "None": None,
+    "isinstance": isinstance, "type": type,
+}
+
+
+def _safe_eval_expression(expression: str, local_vars: dict) -> Any:
+    """
+    Evaluate a computed field expression safely using AST validation.
+
+    Allows simple transforms (math, string methods, attribute access on data)
+    while blocking dangerous operations (__import__, dunder access, etc.).
+
+    Args:
+        expression: The Python expression string to evaluate.
+        local_vars: The local variables (extracted item fields) available to the expression.
+
+    Returns:
+        The result of evaluating the expression.
+
+    Raises:
+        ValueError: If the expression contains disallowed constructs.
+    """
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as e:
+        raise ValueError(f"Invalid expression syntax: {e}")
+
+    for node in ast.walk(tree):
+        # Block import statements
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            raise ValueError("Import statements are not allowed in expressions")
+
+        # Block attribute access to dunder attributes (e.g., __class__, __globals__)
+        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
+            raise ValueError(
+                f"Access to private/dunder attribute '{node.attr}' is not allowed"
+            )
+
+        # Block calls to __import__ or any name starting with _
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id.startswith("_"):
+                raise ValueError(
+                    f"Calling '{func.id}' is not allowed in expressions"
+                )
+            if isinstance(func, ast.Attribute) and func.attr.startswith("_"):
+                raise ValueError(
+                    f"Calling '{func.attr}' is not allowed in expressions"
+                )
+
+    safe_globals = {"__builtins__": _SAFE_EVAL_BUILTINS}
+    return eval(compile(tree, "<expression>", "eval"), safe_globals, local_vars)
+
+
 class JsonElementExtractionStrategy(ExtractionStrategy):
     """
     Abstract base class for extracting structured JSON from HTML content.
@@ -4442,6 +6320,11 @@ class JsonElementExtractionStrategy(ExtractionStrategy):
 
     def _extract_field(self, element, field):
         try:
+            if "source" in field:
+                element = self._resolve_source(element, field["source"])
+                if element is None:
+                    return field.get("default")
+
             if field["type"] == "nested":
                 nested_elements = self._get_elements(element, field["selector"])
                 nested_element = nested_elements[0] if nested_elements else None
@@ -4490,17 +6373,30 @@ class JsonElementExtractionStrategy(ExtractionStrategy):
         else:
             selected = element
 
-        value = None
-        if field["type"] == "text":
-            value = self._get_element_text(selected)
-        elif field["type"] == "attribute":
-            value = self._get_element_attribute(selected, field["attribute"])
-        elif field["type"] == "html":
-            value = self._get_element_html(selected)
-        elif field["type"] == "regex":
-            text = self._get_element_text(selected)
-            match = re.search(field["pattern"], text)
-            value = match.group(1) if match else None
+        type_pipeline = field["type"]
+        if not isinstance(type_pipeline, list):
+            type_pipeline = [type_pipeline]
+        value = selected
+        for step in type_pipeline:
+            if step == "text":
+                value = self._get_element_text(value)
+            elif step == "attribute":
+                value = self._get_element_attribute(value, field["attribute"])
+            elif step == "html":
+                value = self._get_element_html(value)
+            elif step == "regex":
+                pattern = field.get("pattern")
+                if pattern:
+                    # If value is still an element, extract text first (backward compat)
+                    if not isinstance(value, str):
+                        value = self._get_element_text(value)
+                    if isinstance(value, str):
+                        match = re.search(pattern, value)
+                        value = match.group(field.get("group", 1)) if match else None
+                    else:
+                        value = None
+            if value is None:
+                break
 
         if "transform" in field:
             value = self._apply_transform(value, field["transform"])
@@ -4570,7 +6466,7 @@ class JsonElementExtractionStrategy(ExtractionStrategy):
     def _compute_field(self, item, field):
         try:
             if "expression" in field:
-                return eval(field["expression"], {}, item)
+                return _safe_eval_expression(field["expression"], item)
             elif "function" in field:
                 return field["function"](item)
         except Exception as e:
@@ -4614,50 +6510,300 @@ class JsonElementExtractionStrategy(ExtractionStrategy):
         """Get attribute value from element"""
         pass
 
+    @abstractmethod
+    def _resolve_source(self, element, source: str):
+        """Navigate to a sibling element relative to the base element.
+
+        Used when a field's data lives in a sibling of the base element
+        rather than a descendant. For example, Hacker News splits each
+        submission across two sibling <tr> rows.
+
+        Args:
+            element: The current base element.
+            source: A sibling selector string. Currently supports the
+                ``"+ <selector>"`` syntax which navigates to the next
+                sibling matching ``<selector>``.
+
+        Returns:
+            The resolved sibling element, or ``None`` if not found.
+        """
+        pass
+
+    @staticmethod
+    def _validate_schema(
+        schema: dict,
+        html_content: str,
+        schema_type: str = "CSS",
+        expected_fields: Optional[List[str]] = None,
+    ) -> dict:
+        """Run the generated schema against HTML and return a diagnostic result.
+
+        Args:
+            schema: The extraction schema to validate.
+            html_content: The HTML to validate against.
+            schema_type: "CSS" or "XPATH".
+            expected_fields: When provided, enables strict mode — success
+                requires ALL expected fields to be present and populated.
+                When None, uses fuzzy mode (populated_fields > 0).
+
+        Returns a dict with keys: success, base_elements_found, total_fields,
+        populated_fields, field_coverage, field_details, issues,
+        sample_base_html, top_level_structure.
+        """
+        result = {
+            "success": False,
+            "base_elements_found": 0,
+            "total_fields": 0,
+            "populated_fields": 0,
+            "field_coverage": 0.0,
+            "field_details": [],
+            "issues": [],
+            "sample_base_html": "",
+            "top_level_structure": "",
+        }
+
+        try:
+            StrategyClass = (
+                JsonCssExtractionStrategy
+                if schema_type.upper() == "CSS"
+                else JsonXPathExtractionStrategy
+            )
+            strategy = StrategyClass(schema=schema)
+            items = strategy.extract(url="", html_content=html_content)
+        except Exception as e:
+            result["issues"].append(f"Extraction crashed: {e}")
+            return result
+
+        # Count base elements directly
+        try:
+            parsed = strategy._parse_html(html_content)
+            base_elements = strategy._get_base_elements(parsed, schema["baseSelector"])
+            result["base_elements_found"] = len(base_elements)
+
+            # Grab sample innerHTML of first base element (truncated)
+            if base_elements:
+                sample = strategy._get_element_html(base_elements[0])
+                result["sample_base_html"] = sample[:2000]
+        except Exception:
+            pass
+
+        if result["base_elements_found"] == 0:
+            result["issues"].append(
+                f"baseSelector '{schema.get('baseSelector', '')}' matched 0 elements"
+            )
+            result["top_level_structure"] = _get_top_level_structure(html_content)
+            return result
+
+        # Analyze field coverage
+        all_fields = schema.get("fields", [])
+        field_names = [f["name"] for f in all_fields]
+        result["total_fields"] = len(field_names)
+
+        for fname in field_names:
+            values = [item.get(fname) for item in items]
+            populated_count = sum(1 for v in values if v is not None and v != "")
+            sample_val = next((v for v in values if v is not None and v != ""), None)
+            if sample_val is not None:
+                sample_val = str(sample_val)[:120]
+            result["field_details"].append({
+                "name": fname,
+                "populated_count": populated_count,
+                "total_count": len(items),
+                "sample_value": sample_val,
+            })
+
+        result["populated_fields"] = sum(
+            1 for fd in result["field_details"] if fd["populated_count"] > 0
+        )
+        if result["total_fields"] > 0:
+            result["field_coverage"] = result["populated_fields"] / result["total_fields"]
+
+        # Build issues
+        if result["populated_fields"] == 0:
+            result["issues"].append(
+                "All fields returned None/empty — selectors likely wrong"
+            )
+        else:
+            empty_fields = [
+                fd["name"]
+                for fd in result["field_details"]
+                if fd["populated_count"] == 0
+            ]
+            if empty_fields:
+                result["issues"].append(
+                    f"Fields always empty: {', '.join(empty_fields)}"
+                )
+
+        # Check for missing expected fields (strict mode)
+        if expected_fields:
+            schema_field_names = {f["name"] for f in schema.get("fields", [])}
+            missing = [f for f in expected_fields if f not in schema_field_names]
+            if missing:
+                result["issues"].append(
+                    f"Expected fields missing from schema: {', '.join(missing)}"
+                )
+
+        # Success criteria
+        if expected_fields:
+            # Strict: all expected fields must exist in schema AND be populated
+            schema_field_names = {f["name"] for f in schema.get("fields", [])}
+            populated_names = {
+                fd["name"] for fd in result["field_details"] if fd["populated_count"] > 0
+            }
+            result["success"] = (
+                result["base_elements_found"] > 0
+                and all(f in populated_names for f in expected_fields)
+            )
+        else:
+            # Fuzzy: at least something extracted
+            result["success"] = (
+                result["base_elements_found"] > 0 and result["populated_fields"] > 0
+            )
+        return result
+
+    @staticmethod
+    def _build_feedback_message(
+        validation_result: dict,
+        schema: dict,
+        attempt: int,
+        is_repeated: bool,
+    ) -> str:
+        """Build a structured feedback message from a validation result."""
+        vr = validation_result
+        parts = []
+
+        parts.append(f"## Schema Validation — Attempt {attempt}")
+
+        # Base selector
+        if vr["base_elements_found"] == 0:
+            parts.append(
+                f"**CRITICAL:** baseSelector `{schema.get('baseSelector', '')}` "
+                f"matched **0 elements**. The schema cannot extract anything."
+            )
+            if vr["top_level_structure"]:
+                parts.append(
+                    "Here is the top-level HTML structure so you can pick a valid selector:\n```\n"
+                    + vr["top_level_structure"]
+                    + "\n```"
+                )
+        else:
+            parts.append(
+                f"baseSelector matched **{vr['base_elements_found']}** element(s)."
+            )
+
+        # Field coverage table
+        if vr["field_details"]:
+            parts.append(
+                f"\n**Field coverage:** {vr['populated_fields']}/{vr['total_fields']} fields have data\n"
+            )
+            parts.append("| Field | Populated | Sample |")
+            parts.append("|-------|-----------|--------|")
+            for fd in vr["field_details"]:
+                sample = fd["sample_value"] or "*(empty)*"
+                parts.append(
+                    f"| {fd['name']} | {fd['populated_count']}/{fd['total_count']} | {sample} |"
+                )
+
+        # Issues
+        if vr["issues"]:
+            parts.append("\n**Issues:**")
+            for issue in vr["issues"]:
+                parts.append(f"- {issue}")
+
+        # Sample base HTML when all fields empty
+        if vr["populated_fields"] == 0 and vr["sample_base_html"]:
+            parts.append(
+                "\nHere is the innerHTML of the first base element — "
+                "use it to find correct child selectors:\n```html\n"
+                + vr["sample_base_html"]
+                + "\n```"
+            )
+
+        # Repeated schema warning
+        if is_repeated:
+            parts.append(
+                "\n**WARNING:** You returned the exact same schema as before. "
+                "You MUST change the selectors to fix the issues above."
+            )
+
+        parts.append(
+            "\nPlease fix the schema and return ONLY valid JSON, nothing else."
+        )
+        return "\n".join(parts)
+
+    @staticmethod
+    async def _infer_target_json(query: str, html_snippet: str, llm_config, url: str = None, usage: 'TokenUsage' = None) -> Optional[dict]:
+        """Infer a target JSON example from a query and HTML snippet via a quick LLM call.
+
+        Args:
+            usage: Optional TokenUsage accumulator. If provided, token counts from
+                   this LLM call are added to it in-place.
+
+        Returns the parsed dict, or None if inference fails.
+        """
+        from .utils import aperform_completion_with_backoff
+
+        url_line = f"URL: {url}\n" if url else ""
+        prompt = (
+            "You are given a data extraction request and a snippet of HTML from a webpage.\n"
+            "Your job is to produce a single example JSON object representing ONE item "
+            "that the user wants to extract.\n\n"
+            "Rules:\n"
+            "- Return ONLY a valid JSON object — one flat object, NOT wrapped in an array or outer key.\n"
+            "- The object represents a single repeated item (e.g., one product, one article, one row).\n"
+            "- Use clean snake_case field names matching the user's description.\n"
+            "- If the item has nested repeated sub-items, represent those as an array with one example inside.\n"
+            "- Fill values with realistic examples from the HTML so the meaning is clear.\n\n"
+            'Example — if the request is "extract product name, price, and reviews":\n'
+            '{"name": "Widget Pro", "price": "$29.99", "reviews": [{"author": "Jane", "text": "Great product"}]}\n\n'
+            f"{url_line}"
+            f"Extraction request: {query}\n\n"
+            f"HTML snippet:\n```html\n{html_snippet[:2000]}\n```\n\n"
+            "Return ONLY the JSON object for ONE item:"
+        )
+
+        try:
+            response = await aperform_completion_with_backoff(
+                provider=llm_config.provider,
+                prompt_with_variables=prompt,
+                json_response=True,
+                api_token=llm_config.api_token,
+                base_url=llm_config.base_url,
+            )
+            if usage is not None:
+                usage.completion_tokens += response.usage.completion_tokens
+                usage.prompt_tokens += response.usage.prompt_tokens
+                usage.total_tokens += response.usage.total_tokens
+            raw = response.choices[0].message.content
+            if not raw or not raw.strip():
+                return None
+            return json.loads(_strip_markdown_fences(raw))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_expected_fields(target_json: dict) -> List[str]:
+        """Extract top-level field names from a target JSON example."""
+        return list(target_json.keys())
+
     _GENERATE_SCHEMA_UNWANTED_PROPS = {
         'provider': 'Instead, use llm_config=LLMConfig(provider="...")',
         'api_token': 'Instead, use llm_config=LlMConfig(api_token="...")',
     }
 
     @staticmethod
-    def generate_schema(
-        html: str,
-        schema_type: str = "CSS", # or XPATH
-        query: str = None,
-        target_json_example: str = None,
-        llm_config: 'LLMConfig' = create_llm_config(),
-        provider: str = None,
-        api_token: str = None,
-        **kwargs
-    ) -> dict:
+    def _build_schema_prompt(html: str, schema_type: str, query: str = None, target_json_example: str = None) -> str:
         """
-        Generate extraction schema from HTML content and optional query.
-        
-        Args:
-            html (str): The HTML content to analyze
-            query (str, optional): Natural language description of what data to extract
-            provider (str): Legacy Parameter. LLM provider to use 
-            api_token (str): Legacy Parameter. API token for LLM provider
-            llm_config (LLMConfig): LLM configuration object
-            prompt (str, optional): Custom prompt template to use
-            **kwargs: Additional args passed to LLM processor
-            
+        Build the prompt for schema generation. Shared by sync and async methods.
+
         Returns:
-            dict: Generated schema following the JsonElementExtractionStrategy format
+            str: Combined system and user prompt
         """
         from .prompts import JSON_SCHEMA_BUILDER
-        from .utils import perform_completion_with_backoff
-        for name, message in JsonElementExtractionStrategy._GENERATE_SCHEMA_UNWANTED_PROPS.items():
-            if locals()[name] is not None:
-                raise AttributeError(f"Setting '{name}' is deprecated. {message}")
-        
-        # Use default or custom prompt
+
         prompt_template = JSON_SCHEMA_BUILDER if schema_type == "CSS" else JSON_SCHEMA_BUILDER_XPATH
-        
-        # Build the prompt
-        system_message = {
-            "role": "system", 
-            "content": f"""You specialize in generating special JSON schemas for web scraping. This schema uses CSS or XPATH selectors to present a repetitive pattern in crawled HTML, such as a product in a product list or a search result item in a list of search results. We use this JSON schema to pass to a language model along with the HTML content to extract structured data from the HTML. The language model uses the JSON schema to extract data from the HTML and retrieve values for fields in the JSON schema, following the schema.
+
+        system_content = f"""You specialize in generating special JSON schemas for web scraping. This schema uses CSS or XPATH selectors to present a repetitive pattern in crawled HTML, such as a product in a product list or a search result item in a list of search results. We use this JSON schema to pass to a language model along with the HTML content to extract structured data from the HTML. The language model uses the JSON schema to extract data from the HTML and retrieve values for fields in the JSON schema, following the schema.
 
 Generating this HTML manually is not feasible, so you need to generate the JSON schema using the HTML content. The HTML copied from the crawled website is provided below, which we believe contains the repetitive pattern.
 
@@ -4678,51 +6824,334 @@ In this scenario, use your best judgment to generate the schema. You need to exa
 
 # What are the instructions and details for this schema generation?
 {prompt_template}"""
-        }
-        
-        user_message = {
-            "role": "user",
-            "content": f"""
+
+        user_content = f"""
                 HTML to analyze:
                 ```html
                 {html}
                 ```
                 """
-        }
 
         if query:
-            user_message["content"] += f"\n\n## Query or explanation of target/goal data item:\n{query}"
+            user_content += f"\n\n## Query or explanation of target/goal data item:\n{query}"
         if target_json_example:
-            user_message["content"] += f"\n\n## Example of target JSON object:\n```json\n{target_json_example}\n```"
+            user_content += f"\n\n## Example of target JSON object:\n```json\n{target_json_example}\n```"
 
         if query and not target_json_example:
-            user_message["content"] += """IMPORTANT: To remind you, in this process, we are not providing a rigid example of the adjacent objects we seek. We rely on your understanding of the explanation provided in the above section. Make sure to grasp what we are looking for and, based on that, create the best schema.."""
+            user_content += """IMPORTANT: To remind you, in this process, we are not providing a rigid example of the adjacent objects we seek. We rely on your understanding of the explanation provided in the above section. Make sure to grasp what we are looking for and, based on that, create the best schema.."""
         elif not query and target_json_example:
-            user_message["content"] += """IMPORTANT: Please remember that in this process, we provided a proper example of a target JSON object. Make sure to adhere to the structure and create a schema that exactly fits this example. If you find that some elements on the page do not match completely, vote for the majority."""
+            user_content += """IMPORTANT: Please remember that in this process, we provided a proper example of a target JSON object. Make sure to adhere to the structure and create a schema that exactly fits this example. If you find that some elements on the page do not match completely, vote for the majority."""
         elif not query and not target_json_example:
-            user_message["content"] += """IMPORTANT: Since we neither have a query nor an example, it is crucial to rely solely on the HTML content provided. Leverage your expertise to determine the schema based on the repetitive patterns observed in the content."""
-        
-        user_message["content"] += """IMPORTANT: Ensure your schema remains reliable by avoiding selectors that appear to generate dynamically and are not dependable. You want a reliable schema, as it consistently returns the same data even after many page reloads.
+            user_content += """IMPORTANT: Since we neither have a query nor an example, it is crucial to rely solely on the HTML content provided. Leverage your expertise to determine the schema based on the repetitive patterns observed in the content."""
+
+        user_content += """IMPORTANT:
+        0/ Ensure your schema remains reliable by avoiding selectors that appear to generate dynamically and are not dependable. You want a reliable schema, as it consistently returns the same data even after many page reloads.
+        1/ DO NOT USE use base64 kind of classes, they are temporary and not reliable.
+        2/ Every selector must refer to only one unique element. You should ensure your selector points to a single element and is unique to the place that contains the information. You have to use available techniques based on CSS or XPATH requested schema to make sure your selector is unique and also not fragile, meaning if we reload the page now or in the future, the selector should remain reliable.
+        3/ Do not use Regex as much as possible.
 
         Analyze the HTML and generate a JSON schema that follows the specified format. Only output valid JSON schema, nothing else.
         """
 
+        return "\n\n".join([system_content, user_content])
+
+    @staticmethod
+    def generate_schema(
+        html: str = None,
+        schema_type: str = "CSS",
+        query: str = None,
+        target_json_example: str = None,
+        llm_config: 'LLMConfig' = create_llm_config(),
+        provider: str = None,
+        api_token: str = None,
+        url: Union[str, List[str]] = None,
+        validate: bool = True,
+        max_refinements: int = 3,
+        usage: 'TokenUsage' = None,
+        **kwargs
+    ) -> dict:
+        """
+        Generate extraction schema from HTML content or URL(s) (sync version).
+
+        Args:
+            html (str, optional): The HTML content to analyze. If not provided, url must be set.
+            schema_type (str): "CSS" or "XPATH". Defaults to "CSS".
+            query (str, optional): Natural language description of what data to extract.
+            target_json_example (str, optional): Example of desired JSON output.
+            llm_config (LLMConfig): LLM configuration object.
+            provider (str): Legacy Parameter. LLM provider to use.
+            api_token (str): Legacy Parameter. API token for LLM provider.
+            url (str or List[str], optional): URL(s) to fetch HTML from. If provided, html parameter is ignored.
+                When multiple URLs are provided, HTMLs are fetched in parallel and concatenated.
+            validate (bool): If True, validate the schema against the HTML and
+                refine via LLM feedback loop. Defaults to False (zero overhead).
+            max_refinements (int): Max refinement rounds when validate=True. Defaults to 3.
+            usage (TokenUsage, optional): Token usage accumulator. If provided,
+                token counts from all LLM calls (including inference and
+                validation retries) are added to it in-place.
+            **kwargs: Additional args passed to LLM processor.
+
+        Returns:
+            dict: Generated schema following the JsonElementExtractionStrategy format.
+
+        Raises:
+            ValueError: If neither html nor url is provided.
+        """
+        import asyncio
+
         try:
-            # Call LLM with backoff handling
-            response = perform_completion_with_backoff(
-                provider=llm_config.provider,
-                prompt_with_variables="\n\n".join([system_message["content"], user_message["content"]]),
-                json_response = True,                
-                api_token=llm_config.api_token,
-                base_url=llm_config.base_url,
-                extra_args=kwargs
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        coro = JsonElementExtractionStrategy.agenerate_schema(
+            html=html,
+            schema_type=schema_type,
+            query=query,
+            target_json_example=target_json_example,
+            llm_config=llm_config,
+            provider=provider,
+            api_token=api_token,
+            url=url,
+            validate=validate,
+            max_refinements=max_refinements,
+            usage=usage,
+            **kwargs
+        )
+
+        if loop is None:
+            return asyncio.run(coro)
+        else:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(asyncio.run, coro)
+                return future.result()
+
+    @staticmethod
+    async def agenerate_schema(
+        html: str = None,
+        schema_type: str = "CSS",
+        query: str = None,
+        target_json_example: str = None,
+        llm_config: 'LLMConfig' = None,
+        provider: str = None,
+        api_token: str = None,
+        url: Union[str, List[str]] = None,
+        validate: bool = True,
+        max_refinements: int = 3,
+        usage: 'TokenUsage' = None,
+        **kwargs
+    ) -> dict:
+        """
+        Generate extraction schema from HTML content or URL(s) (async version).
+
+        Use this method when calling from async contexts (e.g., FastAPI) to avoid
+        issues with certain LLM providers (e.g., Gemini/Vertex AI) that require
+        async execution.
+
+        Args:
+            html (str, optional): The HTML content to analyze. If not provided, url must be set.
+            schema_type (str): "CSS" or "XPATH". Defaults to "CSS".
+            query (str, optional): Natural language description of what data to extract.
+            target_json_example (str, optional): Example of desired JSON output.
+            llm_config (LLMConfig): LLM configuration object.
+            provider (str): Legacy Parameter. LLM provider to use.
+            api_token (str): Legacy Parameter. API token for LLM provider.
+            url (str or List[str], optional): URL(s) to fetch HTML from. If provided, html parameter is ignored.
+                When multiple URLs are provided, HTMLs are fetched in parallel and concatenated.
+            validate (bool): If True, validate the schema against the HTML and
+                refine via LLM feedback loop. Defaults to False (zero overhead).
+            max_refinements (int): Max refinement rounds when validate=True. Defaults to 3.
+            usage (TokenUsage, optional): Token usage accumulator. If provided,
+                token counts from all LLM calls (including inference and
+                validation retries) are added to it in-place.
+            **kwargs: Additional args passed to LLM processor.
+
+        Returns:
+            dict: Generated schema following the JsonElementExtractionStrategy format.
+
+        Raises:
+            ValueError: If neither html nor url is provided.
+        """
+        from .utils import aperform_completion_with_backoff, preprocess_html_for_schema
+
+        # Validate inputs
+        if html is None and (url is None or (isinstance(url, list) and len(url) == 0)):
+            raise ValueError("Either 'html' or 'url' must be provided")
+
+        # Check deprecated parameters
+        for name, message in JsonElementExtractionStrategy._GENERATE_SCHEMA_UNWANTED_PROPS.items():
+            if locals()[name] is not None:
+                raise AttributeError(f"Setting '{name}' is deprecated. {message}")
+
+        if llm_config is None:
+            llm_config = create_llm_config()
+
+        # Save original HTML(s) before preprocessing (for validation against real HTML)
+        original_htmls = []
+
+        # Fetch HTML from URL(s) if provided
+        if url is not None:
+            from .async_webcrawler import AsyncWebCrawler
+            from .async_configs import BrowserConfig, CrawlerRunConfig, CacheMode
+
+            browser_config = BrowserConfig(
+                headless=True,
+                text_mode=True,
+                light_mode=True,
             )
-            
-            # Extract and return schema
-            return json.loads(response.choices[0].message.content)
-            
-        except Exception as e:
-            raise Exception(f"Failed to generate schema: {str(e)}")
+            crawler_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
+
+            # Normalize to list
+            urls = [url] if isinstance(url, str) else url
+
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                if len(urls) == 1:
+                    result = await crawler.arun(url=urls[0], config=crawler_config)
+                    if not result.success:
+                        raise Exception(f"Failed to fetch URL '{urls[0]}': {result.error_message}")
+                    if result.status_code >= 400:
+                        raise Exception(f"HTTP {result.status_code} error for URL '{urls[0]}'")
+                    html = result.html
+                    original_htmls = [result.html]
+                else:
+                    results = await crawler.arun_many(urls=urls, config=crawler_config)
+                    html_parts = []
+                    for i, result in enumerate(results, 1):
+                        if not result.success:
+                            raise Exception(f"Failed to fetch URL '{result.url}': {result.error_message}")
+                        if result.status_code >= 400:
+                            raise Exception(f"HTTP {result.status_code} error for URL '{result.url}'")
+                        original_htmls.append(result.html)
+                        cleaned = preprocess_html_for_schema(
+                            html_content=result.html,
+                            text_threshold=2000,
+                            attr_value_threshold=500,
+                            max_size=500_000
+                        )
+                        header = HTML_EXAMPLE_DELIMITER.format(index=i)
+                        html_parts.append(f"{header}\n{cleaned}")
+                    html = "\n\n".join(html_parts)
+        else:
+            original_htmls = [html]
+
+        # Preprocess HTML for schema generation (skip if already preprocessed from multiple URLs)
+        if url is None or isinstance(url, str):
+            html = preprocess_html_for_schema(
+                html_content=html,
+                text_threshold=2000,
+                attr_value_threshold=500,
+                max_size=500_000
+            )
+
+        # --- Resolve expected fields for strict validation ---
+        expected_fields = None
+        if validate:
+            if target_json_example:
+                # User provided target JSON — extract field names from it
+                try:
+                    if isinstance(target_json_example, str):
+                        target_obj = json.loads(target_json_example)
+                    else:
+                        target_obj = target_json_example
+                    expected_fields = JsonElementExtractionStrategy._extract_expected_fields(target_obj)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            elif query:
+                # No target JSON but query describes fields — infer via quick LLM call
+                first_url = None
+                if url is not None:
+                    first_url = url if isinstance(url, str) else url[0]
+                inferred = await JsonElementExtractionStrategy._infer_target_json(
+                    query=query, html_snippet=html, llm_config=llm_config, url=first_url, usage=usage
+                )
+                if inferred:
+                    expected_fields = JsonElementExtractionStrategy._extract_expected_fields(inferred)
+                    # Also inject as target_json_example for the schema prompt
+                    if not target_json_example:
+                        target_json_example = json.dumps(inferred, indent=2)
+
+        prompt = JsonElementExtractionStrategy._build_schema_prompt(html, schema_type, query, target_json_example)
+        messages = [{"role": "user", "content": prompt}]
+
+        prev_schema_json = None
+        last_schema = None
+        max_attempts = 1 + (max_refinements if validate else 0)
+
+        for attempt in range(max_attempts):
+            try:
+                response = await aperform_completion_with_backoff(
+                    provider=llm_config.provider,
+                    prompt_with_variables=prompt,
+                    json_response=True,
+                    api_token=llm_config.api_token,
+                    base_url=llm_config.base_url,
+                    messages=messages,
+                    extra_args=kwargs,
+                )
+                if usage is not None:
+                    usage.completion_tokens += response.usage.completion_tokens
+                    usage.prompt_tokens += response.usage.prompt_tokens
+                    usage.total_tokens += response.usage.total_tokens
+                raw = response.choices[0].message.content
+                if not raw or not raw.strip():
+                    raise ValueError("LLM returned an empty response")
+
+                schema = json.loads(_strip_markdown_fences(raw))
+                last_schema = schema
+            except json.JSONDecodeError as e:
+                # JSON parse failure — ask LLM to fix it
+                if not validate or attempt >= max_attempts - 1:
+                    raise Exception(f"Failed to parse schema JSON: {str(e)}")
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({"role": "user", "content": (
+                    f"Your response was not valid JSON. Parse error: {e}\n"
+                    "Please return ONLY valid JSON, nothing else."
+                )})
+                continue
+            except Exception as e:
+                raise Exception(f"Failed to generate schema: {str(e)}")
+
+            # If validation is off, return immediately (zero overhead path)
+            if not validate:
+                return schema
+
+            # --- Validation feedback loop ---
+            # Validate against original HTML(s); success if works on at least one
+            best_result = None
+            for orig_html in original_htmls:
+                vr = JsonElementExtractionStrategy._validate_schema(
+                    schema, orig_html, schema_type,
+                    expected_fields=expected_fields,
+                )
+                if best_result is None or vr["populated_fields"] > best_result["populated_fields"]:
+                    best_result = vr
+                if vr["success"]:
+                    break
+
+            if best_result["success"]:
+                return schema
+
+            # Last attempt — return best-effort
+            if attempt >= max_attempts - 1:
+                return schema
+
+            # Detect repeated schema
+            current_json = json.dumps(schema, sort_keys=True)
+            is_repeated = current_json == prev_schema_json
+            prev_schema_json = current_json
+
+            # Build feedback and extend conversation
+            feedback = JsonElementExtractionStrategy._build_feedback_message(
+                best_result, schema, attempt + 1, is_repeated
+            )
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "user", "content": feedback})
+
+        # Should not reach here, but return last schema as safety net
+        if last_schema is not None:
+            return last_schema
+        raise Exception("Failed to generate schema: no attempts succeeded")
 
 class JsonCssExtractionStrategy(JsonElementExtractionStrategy):
     """
@@ -4770,6 +7199,21 @@ class JsonCssExtractionStrategy(JsonElementExtractionStrategy):
 
     def _get_element_attribute(self, element, attribute: str):
         return element.get(attribute)
+
+    def _resolve_source(self, element, source: str):
+        source = source.strip()
+        if not source.startswith("+"):
+            return None
+        sel = source[1:].strip()  # e.g. "tr", "tr.subtext", ".classname"
+        parts = sel.split(".")
+        tag = parts[0].strip() or None
+        classes = [p.strip() for p in parts[1:] if p.strip()]
+        kwargs = {}
+        if classes:
+            kwargs["class_"] = lambda c, _cls=classes: c and all(
+                cl in c for cl in _cls
+            )
+        return element.find_next_sibling(tag, **kwargs)
 
 class JsonLxmlExtractionStrategy(JsonElementExtractionStrategy):
     def __init__(self, schema: Dict[str, Any], **kwargs):
@@ -5036,7 +7480,22 @@ class JsonLxmlExtractionStrategy(JsonElementExtractionStrategy):
             if self.verbose:
                 print(f"Error getting attribute '{attribute}': {e}")
             return None
-            
+
+    def _resolve_source(self, element, source: str):
+        source = source.strip()
+        if not source.startswith("+"):
+            return None
+        sel = source[1:].strip()
+        parts = sel.split(".")
+        tag = parts[0].strip() or "*"
+        classes = [p.strip() for p in parts[1:] if p.strip()]
+        xpath = f"./following-sibling::{tag}"
+        for cls in classes:
+            xpath += f"[contains(concat(' ',normalize-space(@class),' '),' {cls} ')]"
+        xpath += "[1]"
+        results = element.xpath(xpath)
+        return results[0] if results else None
+
     def _clear_caches(self):
         """Clear caches to free memory"""
         if self.use_caching:
@@ -5137,7 +7596,22 @@ class JsonLxmlExtractionStrategy_naive(JsonElementExtractionStrategy):
         return etree.tostring(element, encoding='unicode')
     
     def _get_element_attribute(self, element, attribute: str):
-        return element.get(attribute)    
+        return element.get(attribute)
+
+    def _resolve_source(self, element, source: str):
+        source = source.strip()
+        if not source.startswith("+"):
+            return None
+        sel = source[1:].strip()
+        parts = sel.split(".")
+        tag = parts[0].strip() or "*"
+        classes = [p.strip() for p in parts[1:] if p.strip()]
+        xpath = f"./following-sibling::{tag}"
+        for cls in classes:
+            xpath += f"[contains(concat(' ',normalize-space(@class),' '),' {cls} ')]"
+        xpath += "[1]"
+        results = element.xpath(xpath)
+        return results[0] if results else None
 
 class JsonXPathExtractionStrategy(JsonElementExtractionStrategy):
     """
@@ -5203,14 +7677,331 @@ class JsonXPathExtractionStrategy(JsonElementExtractionStrategy):
     def _get_element_attribute(self, element, attribute: str):
         return element.get(attribute)
 
+    def _resolve_source(self, element, source: str):
+        source = source.strip()
+        if not source.startswith("+"):
+            return None
+        sel = source[1:].strip()
+        parts = sel.split(".")
+        tag = parts[0].strip() or "*"
+        classes = [p.strip() for p in parts[1:] if p.strip()]
+        xpath = f"./following-sibling::{tag}"
+        for cls in classes:
+            xpath += f"[contains(concat(' ',normalize-space(@class),' '),' {cls} ')]"
+        xpath += "[1]"
+        results = element.xpath(xpath)
+        return results[0] if results else None
+
+"""
+RegexExtractionStrategy
+Fast, zero-LLM extraction of common entities via regular expressions.
+"""
+
+_CTRL = {c: rf"\x{ord(c):02x}" for c in map(chr, range(32)) if c not in "\t\n\r"}
+
+_WB_FIX = re.compile(r"\x08")               # stray back-space   →   word-boundary
+_NEEDS_ESCAPE = re.compile(r"(?<!\\)\\(?![\\u])")   # lone backslash
+
+def _sanitize_schema(schema: Dict[str, str]) -> Dict[str, str]:
+    """Fix common JSON-escape goofs coming from LLMs or manual edits."""
+    safe = {}
+    for label, pat in schema.items():
+        # 1️⃣ replace accidental control chars (inc. the infamous back-space)
+        pat = _WB_FIX.sub(r"\\b", pat).translate(_CTRL)
+
+        # 2️⃣ double any single backslash that JSON kept single
+        pat = _NEEDS_ESCAPE.sub(r"\\\\", pat)
+
+        # 3️⃣ quick sanity compile
+        try:
+            re.compile(pat)
+        except re.error as e:
+            raise ValueError(f"Regex for '{label}' won’t compile after fix: {e}") from None
+
+        safe[label] = pat
+    return safe
+
+
+class RegexExtractionStrategy(ExtractionStrategy):
+    """
+    A lean strategy that finds e-mails, phones, URLs, dates, money, etc.,
+    using nothing but pre-compiled regular expressions.
+
+    Extraction returns::
+
+        {
+            "url":   "<page-url>",
+            "label": "<pattern-label>",
+            "value": "<matched-string>",
+            "span":  [start, end]
+        }
+
+    Only `generate_schema()` touches an LLM, extraction itself is pure Python.
+    """
+
+    # -------------------------------------------------------------- #
+    # Built-in patterns exposed as IntFlag so callers can bit-OR them
+    # -------------------------------------------------------------- #
+    class _B(IntFlag):
+        EMAIL           = auto()
+        PHONE_INTL      = auto()
+        PHONE_US        = auto()
+        URL             = auto()
+        IPV4            = auto()
+        IPV6            = auto()
+        UUID            = auto()
+        CURRENCY        = auto()
+        PERCENTAGE      = auto()
+        NUMBER          = auto()
+        DATE_ISO        = auto()
+        DATE_US         = auto()
+        TIME_24H        = auto()
+        POSTAL_US       = auto()
+        POSTAL_UK       = auto()
+        HTML_COLOR_HEX  = auto()
+        TWITTER_HANDLE  = auto()
+        HASHTAG         = auto()
+        MAC_ADDR        = auto()
+        IBAN            = auto()
+        CREDIT_CARD     = auto()
+        NOTHING         = auto()
+        ALL             = (
+            EMAIL | PHONE_INTL | PHONE_US | URL | IPV4 | IPV6 | UUID
+            | CURRENCY | PERCENTAGE | NUMBER | DATE_ISO | DATE_US | TIME_24H
+            | POSTAL_US | POSTAL_UK | HTML_COLOR_HEX | TWITTER_HANDLE
+            | HASHTAG | MAC_ADDR | IBAN | CREDIT_CARD
+        )
+
+    # user-friendly aliases  (RegexExtractionStrategy.Email, .IPv4, …)
+    Email          = _B.EMAIL
+    PhoneIntl      = _B.PHONE_INTL
+    PhoneUS        = _B.PHONE_US
+    Url            = _B.URL
+    IPv4           = _B.IPV4
+    IPv6           = _B.IPV6
+    Uuid           = _B.UUID
+    Currency       = _B.CURRENCY
+    Percentage     = _B.PERCENTAGE
+    Number         = _B.NUMBER
+    DateIso        = _B.DATE_ISO
+    DateUS         = _B.DATE_US
+    Time24h        = _B.TIME_24H
+    PostalUS       = _B.POSTAL_US
+    PostalUK       = _B.POSTAL_UK
+    HexColor       = _B.HTML_COLOR_HEX
+    TwitterHandle  = _B.TWITTER_HANDLE
+    Hashtag        = _B.HASHTAG
+    MacAddr        = _B.MAC_ADDR
+    Iban           = _B.IBAN
+    CreditCard     = _B.CREDIT_CARD
+    All            = _B.ALL
+    Nothing        = _B(0)  # no patterns
+
+    # ------------------------------------------------------------------ #
+    # Built-in pattern catalog
+    # ------------------------------------------------------------------ #
+    DEFAULT_PATTERNS: Dict[str, str] = {
+        # Communication
+        "email":           r"[\w.+-]+@[\w-]+\.[\w.-]+",
+        "phone_intl":      r"\+?\d[\d .()-]{7,}\d",
+        "phone_us":        r"\(?\d{3}\)?[ -. ]?\d{3}[ -. ]?\d{4}",
+        # Web
+        "url":             r"https?://[^\s\"'<>]+",
+        "ipv4":            r"(?:\d{1,3}\.){3}\d{1,3}",
+        "ipv6":            r"[A-F0-9]{1,4}(?::[A-F0-9]{1,4}){7}",
+        # IDs
+        "uuid":            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        # Money / numbers
+        "currency":        r"(?:USD|EUR|RM|\$|€|£)\s?\d+(?:[.,]\d{2})?",
+        "percentage":      r"\d+(?:\.\d+)?%",
+        "number":          r"\b\d{1,3}(?:[,.\s]\d{3})*(?:\.\d+)?\b",
+        # Dates / Times
+        "date_iso":        r"\d{4}-\d{2}-\d{2}",
+        "date_us":         r"\d{1,2}/\d{1,2}/\d{2,4}",
+        "time_24h":        r"\b(?:[01]?\d|2[0-3]):[0-5]\d(?:[:.][0-5]\d)?\b",
+        # Misc
+        "postal_us":       r"\b\d{5}(?:-\d{4})?\b",
+        "postal_uk":       r"\b[A-Z]{1,2}\d[A-Z\d]? ?\d[A-Z]{2}\b",
+        "html_color_hex":  r"#[0-9A-Fa-f]{6}\b",
+        "twitter_handle":  r"@[\w]{1,15}",
+        "hashtag":         r"#[\w-]+",
+        "mac_addr":        r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}",
+        "iban":            r"[A-Z]{2}\d{2}[A-Z0-9]{11,30}",
+        "credit_card":     r"\b(?:4\d{12}(?:\d{3})?|5[1-5]\d{14}|3[47]\d{13}|6(?:011|5\d{2})\d{12})\b",
+    }
+
+    _FLAGS = re.IGNORECASE | re.MULTILINE
+    _UNWANTED_PROPS = {
+        "provider": "Use llm_config instead",
+        "api_token": "Use llm_config instead",
+    }
+
+    # ------------------------------------------------------------------ #
+    # Construction
+    # ------------------------------------------------------------------ #
+    def __init__(
+        self,
+        pattern: "_B" = _B.NOTHING,
+        *,
+        custom: Optional[Union[Dict[str, str], List[Tuple[str, str]]]] = None,
+        input_format: str = "fit_html",
+        **kwargs,
+    ) -> None:
+        """
+        Args:
+            patterns: Custom patterns overriding or extending defaults.
+                      Dict[label, regex] or list[tuple(label, regex)].
+            input_format: "html", "markdown" or "text".
+            **kwargs: Forwarded to ExtractionStrategy.
+        """
+        super().__init__(input_format=input_format, **kwargs)
+
+        # 1️⃣  take only the requested built-ins
+        merged: Dict[str, str] = {
+            key: rx
+            for key, rx in self.DEFAULT_PATTERNS.items()
+            if getattr(self._B, key.upper()).value & pattern
+        }
+
+        # 2️⃣  apply user overrides / additions
+        if custom:
+            if isinstance(custom, dict):
+                merged.update(custom)
+            else:  # iterable of (label, regex)
+                merged.update({lbl: rx for lbl, rx in custom})
+
+        self._compiled: Dict[str, Pattern] = {
+            lbl: re.compile(rx, self._FLAGS) for lbl, rx in merged.items()
+        }
+
+    # ------------------------------------------------------------------ #
+    # Extraction
+    # ------------------------------------------------------------------ #
+    def extract(self, url: str, content: str, *q, **kw) -> List[Dict[str, Any]]:
+        # text = self._plain_text(html)
+        out: List[Dict[str, Any]] = []
+
+        for label, cre in self._compiled.items():
+            for m in cre.finditer(content):
+                out.append(
+                    {
+                        "url": url,
+                        "label": label,
+                        "value": m.group(0),
+                        "span": [m.start(), m.end()],
+                    }
+                )
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Helpers
+    # ------------------------------------------------------------------ #
+    def _plain_text(self, content: str) -> str:
+        if self.input_format == "text":
+            return content
+        return BeautifulSoup(content, "lxml").get_text(" ", strip=True)
+
+    # ------------------------------------------------------------------ #
+    # LLM-assisted pattern generator
+    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # LLM-assisted one-off pattern builder
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def generate_pattern(
+        label: str,
+        html: str,
+        *,
+        query: Optional[str] = None,
+        examples: Optional[List[str]] = None,
+        llm_config: Optional[LLMConfig] = None,
+        **kwargs,
+    ) -> Dict[str, str]:
+        """
+        Ask an LLM for a single page-specific regex and return
+            {label: pattern}   ── ready for RegexExtractionStrategy(custom=…)
+        """
+
+        # ── guard deprecated kwargs
+        for k in RegexExtractionStrategy._UNWANTED_PROPS:
+            if k in kwargs:
+                raise AttributeError(
+                    f"{k} is deprecated, {RegexExtractionStrategy._UNWANTED_PROPS[k]}"
+                )
+
+        # ── default LLM config
+        if llm_config is None:
+            llm_config = create_llm_config()
+
+        # ── system prompt – hardened
+        system_msg = (
+            "You are an expert Python-regex engineer.\n"
+            f"Return **one** JSON object whose single key is exactly \"{label}\", "
+            "and whose value is a raw-string regex pattern that works with "
+            "the standard `re` module in Python.\n\n"
+            "Strict rules (obey every bullet):\n"
+            "• If a *user query* is supplied, treat it as the precise semantic target and optimise the "
+            "  pattern to capture ONLY text that answers that query. If the query conflicts with the "
+            "  sample HTML, the HTML wins.\n"
+            "• Tailor the pattern to the *sample HTML* – reproduce its exact punctuation, spacing, "
+            "  symbols, capitalisation, etc. Do **NOT** invent a generic form.\n"
+            "• Keep it minimal and fast: avoid unnecessary capturing, prefer non-capturing `(?: … )`, "
+            "  and guard against catastrophic backtracking.\n"
+            "• Anchor with `^`, `$`, or `\\b` only when it genuinely improves precision.\n"
+            "• Use inline flags like `(?i)` when needed; no verbose flag comments.\n"
+            "• Output must be valid JSON – no markdown, code fences, comments, or extra keys.\n"
+            "• The regex value must be a Python string literal: **double every backslash** "
+            "(e.g. `\\\\b`, `\\\\d`, `\\\\\\\\`).\n\n"
+            "Example valid output:\n"
+            f"{{\"{label}\": \"(?:RM|rm)\\\\s?\\\\d{{1,3}}(?:,\\\\d{{3}})*(?:\\\\.\\\\d{{2}})?\"}}"
+        )
+
+        # ── user message: cropped HTML + optional hints
+        user_parts = ["```html", html[:5000], "```"]  # protect token budget
+        if query:
+            user_parts.append(f"\n\n## Query\n{query.strip()}")
+        if examples:
+            user_parts.append("## Examples\n" + "\n".join(examples[:20]))
+        user_msg = "\n\n".join(user_parts)
+
+        # ── LLM call (with retry/backoff)
+        resp = perform_completion_with_backoff(
+            provider=llm_config.provider,
+            prompt_with_variables="\n\n".join([system_msg, user_msg]),
+            json_response=True,
+            api_token=llm_config.api_token,
+            base_url=llm_config.base_url,
+            extra_args=kwargs,
+        )
+
+        # ── clean & load JSON (fix common escape mistakes *before* json.loads)
+        raw = resp.choices[0].message.content
+        raw = raw.replace("\x08", "\\b")                     # stray back-space → \b
+        raw = re.sub(r'(?<!\\)\\(?![\\u"])', r"\\\\", raw)   # lone \ → \\
+
+        try:
+            pattern_dict = json.loads(raw)
+        except Exception as exc:
+            raise ValueError(f"LLM did not return valid JSON: {raw}") from exc
+
+        # quick sanity-compile
+        for lbl, pat in pattern_dict.items():
+            try:
+                re.compile(pat)
+            except re.error as e:
+                raise ValueError(f"Invalid regex for '{lbl}': {e}") from None
+
+        return pattern_dict
 
 ```
 
 
 ## File: crawl4ai/models.py
 
+
 ```py
-from pydantic import BaseModel, HttpUrl, PrivateAttr
+from pydantic import BaseModel, HttpUrl, PrivateAttr, Field, ConfigDict, BeforeValidator
+from typing import Annotated
 from typing import List, Dict, Optional, Callable, Awaitable, Union, Any
 from typing import AsyncGenerator
 from typing import Generic, TypeVar
@@ -5341,6 +8132,7 @@ class MarkdownGenerationResult(BaseModel):
 class CrawlResult(BaseModel):
     url: str
     html: str
+    fit_html: Optional[str] = None
     success: bool
     cleaned_html: Optional[str] = None
     media: Dict[str, List[Dict]] = {}
@@ -5360,11 +8152,18 @@ class CrawlResult(BaseModel):
     ssl_certificate: Optional[SSLCertificate] = None
     dispatch_result: Optional[DispatchResult] = None
     redirected_url: Optional[str] = None
+    redirected_status_code: Optional[int] = None
     network_requests: Optional[List[Dict[str, Any]]] = None
     console_messages: Optional[List[Dict[str, Any]]] = None
+    tables: List[Dict] = Field(default_factory=list)  # NEW – [{headers,rows,caption,summary}]
+    # Cache validation metadata (Smart Cache)
+    head_fingerprint: Optional[str] = None
+    cached_at: Optional[float] = None
+    cache_status: Optional[str] = None  # "hit", "hit_validated", "hit_fallback", "miss"
+    # Anti-bot retry/proxy usage stats
+    crawl_stats: Optional[Dict[str, Any]] = None
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 # NOTE: The StringCompatibleMarkdown class, custom __init__ method, property getters/setters,
 # and model_dump override all exist to support a smooth transition from markdown as a string
@@ -5463,6 +8262,16 @@ class CrawlResult(BaseModel):
         requirements change, this is where you would update the logic.
         """
         result = super().model_dump(*args, **kwargs)
+        
+        # Remove any property descriptors that might have been included
+        # These deprecated properties should not be in the serialized output
+        for key in ['fit_html', 'fit_markdown', 'markdown_v2']:
+            if key in result and isinstance(result[key], property):
+                # del result[key]
+                # Nasrin: I decided to convert it to string instead of removing it.
+                result[key] = str(result[key])
+        
+        # Add the markdown field properly
         if self._markdown is not None:
             result["markdown"] = self._markdown.model_dump() 
         return result
@@ -5490,6 +8299,10 @@ class CrawlResultContainer(Generic[CrawlResultT]):
 
     def __iter__(self):
         return iter(self._results)
+
+    async def __aiter__(self):
+        for item in self._results:
+            yield item
 
     def __getitem__(self, index):
         return self._results[index]
@@ -5529,15 +8342,24 @@ class AsyncCrawlResponse(BaseModel):
     downloaded_files: Optional[List[str]] = None
     ssl_certificate: Optional[SSLCertificate] = None
     redirected_url: Optional[str] = None
+    redirected_status_code: Optional[int] = None
     network_requests: Optional[List[Dict[str, Any]]] = None
     console_messages: Optional[List[Dict[str, Any]]] = None
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 ###############################
 # Scraping Models
 ###############################
+def _coerce_int(v):
+    """Coerce to int or return None for non-numeric values like '100%' or 'auto'."""
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return None
+
 class MediaItem(BaseModel):
     src: Optional[str] = ""
     data: Optional[str] = ""
@@ -5547,7 +8369,7 @@ class MediaItem(BaseModel):
     type: str = "image"
     group_id: Optional[int] = 0
     format: Optional[str] = None
-    width: Optional[int] = None
+    width: Annotated[Optional[int], BeforeValidator(_coerce_int)] = None
 
 
 class Link(BaseModel):
@@ -5555,6 +8377,12 @@ class Link(BaseModel):
     text: Optional[str] = ""
     title: Optional[str] = ""
     base_domain: Optional[str] = ""
+    head_data: Optional[Dict[str, Any]] = None  # Head metadata extracted from link target
+    head_extraction_status: Optional[str] = None  # "success", "failed", "skipped"
+    head_extraction_error: Optional[str] = None  # Error message if extraction failed
+    intrinsic_score: Optional[float] = None  # Quality score based on URL structure, text, and context
+    contextual_score: Optional[float] = None  # BM25 relevance score based on query and head content
+    total_score: Optional[float] = None  # Combined score from intrinsic and contextual scores
 
 
 class Media(BaseModel):
@@ -5584,6 +8412,7 @@ class ScrapingResult(BaseModel):
 
 
 ## File: crawl4ai/content_filter_strategy.py
+
 
 ```py
 import inspect
@@ -5615,8 +8444,7 @@ import json
 import hashlib
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from .async_logger import AsyncLogger, LogLevel
-from colorama import Fore, Style
+from .async_logger import AsyncLogger, LogLevel, LogColor
 
 
 class RelevantContentFilter(ABC):
@@ -5994,6 +8822,7 @@ class BM25ContentFilter(RelevantContentFilter):
         user_query: str = None,
         bm25_threshold: float = 1.0,
         language: str = "english",
+        use_stemming: bool = True,
     ):
         """
         Initializes the BM25ContentFilter class, if not provided, falls back to page metadata.
@@ -6005,9 +8834,11 @@ class BM25ContentFilter(RelevantContentFilter):
             user_query (str): User query for filtering (optional).
             bm25_threshold (float): BM25 threshold for filtering (default: 1.0).
             language (str): Language for stemming (default: 'english').
+            use_stemming (bool): Whether to apply stemming (default: True).
         """
         super().__init__(user_query=user_query)
         self.bm25_threshold = bm25_threshold
+        self.use_stemming = use_stemming
         self.priority_tags = {
             "h1": 5.0,
             "h2": 4.0,
@@ -6021,7 +8852,7 @@ class BM25ContentFilter(RelevantContentFilter):
             "pre": 1.5,
             "th": 1.5,  # Table headers
         }
-        self.stemmer = stemmer(language)
+        self.stemmer = stemmer(language) if use_stemming else None
 
     def filter_content(self, html: str, min_word_threshold: int = None) -> List[str]:
         """
@@ -6068,13 +8899,19 @@ class BM25ContentFilter(RelevantContentFilter):
         #                 for _, chunk, _, _ in candidates]
         # tokenized_query = [ps.stem(word) for word in query.lower().split()]
 
-        tokenized_corpus = [
-            [self.stemmer.stemWord(word) for word in chunk.lower().split()]
-            for _, chunk, _, _ in candidates
-        ]
-        tokenized_query = [
-            self.stemmer.stemWord(word) for word in query.lower().split()
-        ]
+        if self.use_stemming:
+            tokenized_corpus = [
+                [self.stemmer.stemWord(word) for word in chunk.lower().split()]
+                for _, chunk, _, _ in candidates
+            ]
+            tokenized_query = [
+                self.stemmer.stemWord(word) for word in query.lower().split()
+            ]
+        else:
+            tokenized_corpus = [
+                chunk.lower().split() for _, chunk, _, _ in candidates
+            ]
+            tokenized_query = query.lower().split()
 
         # tokenized_corpus = [[self.stemmer.stemWord(word) for word in tokenize_text(chunk.lower())]
         #            for _, chunk, _, _ in candidates]
@@ -6107,7 +8944,15 @@ class BM25ContentFilter(RelevantContentFilter):
         # Sort selected candidates by original document order
         selected_candidates.sort(key=lambda x: x[0])
 
-        return [self.clean_element(tag) for _, _, tag in selected_candidates]
+        # Deduplicate by chunk text, keeping first occurrence (lowest index)
+        seen_texts = set()
+        unique_candidates = []
+        for index, chunk, tag in selected_candidates:
+            if chunk not in seen_texts:
+                seen_texts.add(chunk)
+                unique_candidates.append((index, chunk, tag))
+
+        return [self.clean_element(tag) for _, _, tag in unique_candidates]
 
 
 class PruningContentFilter(RelevantContentFilter):
@@ -6245,7 +9090,7 @@ class PruningContentFilter(RelevantContentFilter):
 
     def _remove_comments(self, soup):
         """Removes HTML comments"""
-        for element in soup(text=lambda text: isinstance(text, Comment)):
+        for element in soup(string=lambda string: isinstance(string, Comment)):
             element.extract()
 
     def _remove_unwanted_tags(self, soup):
@@ -6434,8 +9279,7 @@ class LLMContentFilter(RelevantContentFilter):
                 },
                 colors={
                     **AsyncLogger.DEFAULT_COLORS,
-                    LogLevel.INFO: Fore.MAGENTA
-                    + Style.DIM,  # Dimmed purple for LLM ops
+                    LogLevel.INFO: LogColor.DIM_MAGENTA  # Dimmed purple for LLM ops
                 },
             )
         else:
@@ -6480,7 +9324,7 @@ class LLMContentFilter(RelevantContentFilter):
                 "Starting LLM markdown content filtering process",
                 tag="LLM",
                 params={"provider": self.llm_config.provider},
-                colors={"provider": Fore.CYAN},
+                colors={"provider": LogColor.CYAN},
             )
 
         # Cache handling
@@ -6517,7 +9361,7 @@ class LLMContentFilter(RelevantContentFilter):
                 "LLM markdown: Split content into {chunk_count} chunks",
                 tag="CHUNK",
                 params={"chunk_count": len(html_chunks)},
-                colors={"chunk_count": Fore.YELLOW},
+                colors={"chunk_count": LogColor.YELLOW},
             )
 
         start_time = time.time()
@@ -6561,6 +9405,9 @@ class LLMContentFilter(RelevantContentFilter):
                         prompt,
                         api_token,
                         base_url=base_url,
+                        base_delay=self.llm_config.backoff_base_delay,
+                        max_attempts=self.llm_config.backoff_max_attempts,
+                        exponential_factor=self.llm_config.backoff_exponential_factor,
                         extra_args=extra_args,
                     )
 
@@ -6626,7 +9473,7 @@ class LLMContentFilter(RelevantContentFilter):
                 "LLM markdown: Completed processing in {time:.2f}s",
                 tag="LLM",
                 params={"time": end_time - start_time},
-                colors={"time": Fore.YELLOW},
+                colors={"time": LogColor.YELLOW},
             )
 
         result = ordered_results if ordered_results else []
@@ -6664,6 +9511,7 @@ class LLMContentFilter(RelevantContentFilter):
 
 ## File: crawl4ai/markdown_generation_strategy.py
 
+
 ```py
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, Tuple
@@ -6675,7 +9523,7 @@ import re
 from urllib.parse import urljoin
 
 # Pre-compile the regex pattern
-LINK_PATTERN = re.compile(r'!?\[([^\]]+)\]\(([^)]+?)(?:\s+"([^"]*)")?\)')
+LINK_PATTERN = re.compile(r'!?\[((?:[^\[\]]|\[(?:[^\[\]]|\[[^\]]*\])*\])*)\]\(((?:[^()\s]|\([^()]*\))*)(?:\s+"([^"]*)")?\)')
 
 
 def fast_urljoin(base: str, url: str) -> str:
@@ -6931,37 +9779,27 @@ class DefaultMarkdownGenerator(MarkdownGenerationStrategy):
 
 ## File: crawl4ai/browser_manager.py
 
+
 ```py
 import asyncio
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 import os
 import sys
 import shutil
 import tempfile
+import psutil  
+import signal
 import subprocess
+import shlex
 from playwright.async_api import BrowserContext
 import hashlib
 from .js_snippet import load_js_script
 from .config import DOWNLOAD_PAGE_TIMEOUT
 from .async_configs import BrowserConfig, CrawlerRunConfig
-from playwright_stealth import StealthConfig
 from .utils import get_chromium_path
+import warnings
 
-stealth_config = StealthConfig(
-    webdriver=True,
-    chrome_app=True,
-    chrome_csi=True,
-    chrome_load_times=True,
-    chrome_runtime=True,
-    navigator_languages=True,
-    navigator_plugins=True,
-    navigator_permissions=True,
-    webgl_vendor=True,
-    outerdimensions=True,
-    navigator_hardware_concurrency=True,
-    media_codecs=True,
-)
 
 BROWSER_DISABLE_OPTIONS = [
     "--disable-background-networking",
@@ -7010,6 +9848,64 @@ class ManagedBrowser:
             _cleanup(): Terminates the browser process and removes the temporary directory.
             create_profile(): Static method to create a user profile by launching a browser for user interaction.
     """
+    
+    @staticmethod
+    def build_browser_flags(config: BrowserConfig) -> List[str]:
+        """Common CLI flags for launching Chromium"""
+        flags = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-infobars",
+            "--window-position=0,0",
+            "--ignore-certificate-errors",
+            "--ignore-certificate-errors-spki-list",
+            "--disable-blink-features=AutomationControlled",
+            "--window-position=400,0",
+            "--disable-renderer-backgrounding",
+            "--disable-ipc-flooding-protection",
+            "--force-color-profile=srgb",
+            "--mute-audio",
+            "--disable-background-timer-throttling",
+            # Memory-saving flags: disable unused Chrome features
+            "--disable-features=OptimizationHints,MediaRouter,DialMediaRouteProvider",
+            "--disable-component-update",
+            "--disable-domain-reliability",
+        ]
+        # GPU flags disable WebGL which anti-bot sensors detect as headless.
+        # Keep WebGL working (via SwiftShader) when stealth mode is active.
+        if not config.enable_stealth:
+            flags.extend([
+                "--disable-gpu",
+                "--disable-gpu-compositing",
+                "--disable-software-rasterizer",
+            ])
+        if config.memory_saving_mode:
+            flags.extend([
+                "--aggressive-cache-discard",
+                '--js-flags=--max-old-space-size=512',
+            ])
+        if config.light_mode:
+            flags.extend(BROWSER_DISABLE_OPTIONS)
+        if config.text_mode:
+            flags.extend([
+                "--blink-settings=imagesEnabled=false",
+                "--disable-remote-fonts",
+                "--disable-images",
+                "--disable-javascript",
+                "--disable-software-rasterizer",
+                "--disable-dev-shm-usage",
+            ])
+        # proxy support — only pass server URL, never credentials.
+        # Chromium's --proxy-server flag silently ignores inline user:pass@.
+        # Auth credentials are handled at the Playwright context level instead.
+        if config.proxy:
+            flags.append(f"--proxy-server={config.proxy}")
+        elif config.proxy_config:
+            flags.append(f"--proxy-server={config.proxy_config.server}")
+        # dedupe
+        return list(dict.fromkeys(flags))
 
     browser_type: str
     user_data_dir: str
@@ -7082,6 +9978,51 @@ class ManagedBrowser:
         
         if self.browser_config.extra_args:
             args.extend(self.browser_config.extra_args)
+            
+
+        # ── make sure no old Chromium instance is owning the same port/profile ──
+        try:
+            if sys.platform == "win32":
+                if psutil is None:
+                    raise RuntimeError("psutil not available, cannot clean old browser")
+                for p in psutil.process_iter(["pid", "name", "cmdline"]):
+                    cl = " ".join(p.info.get("cmdline") or [])
+                    if (
+                        f"--remote-debugging-port={self.debugging_port}" in cl
+                        and f"--user-data-dir={self.user_data_dir}" in cl
+                    ):
+                        p.kill()
+                        p.wait(timeout=5)
+            else:  # macOS / Linux
+                # kill any process listening on the same debugging port
+                try:
+                    pids = (
+                        subprocess.check_output(
+                            shlex.split(f"lsof -t -i:{self.debugging_port}"),
+                            stderr=subprocess.DEVNULL,
+                        )
+                        .decode()
+                        .strip()
+                        .splitlines()
+                    )
+                except (FileNotFoundError, subprocess.CalledProcessError):
+                    pids = []
+                for pid in pids:
+                    try:
+                        os.kill(int(pid), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+
+                # remove Chromium singleton locks, or new launch exits with
+                # “Opening in existing browser session.”
+                for f in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+                    fp = os.path.join(self.user_data_dir, f)
+                    if os.path.exists(fp):
+                        os.remove(fp)
+        except Exception as _e:
+            # non-fatal — we'll try to start anyway, but log what happened
+            self.logger.warning(f"pre-launch cleanup failed: {_e}", tag="BROWSER")            
+            
 
         # Start browser process
         try:
@@ -7101,6 +10042,13 @@ class ManagedBrowser:
                     stderr=subprocess.PIPE,
                     preexec_fn=os.setpgrp  # Start in a new process group
                 )
+                
+            # If verbose is True print args used to run the process
+            if self.logger and self.browser_config.verbose:
+                self.logger.debug(
+                    f"Starting browser with args: {' '.join(args)}",
+                    tag="BROWSER"
+                )    
                 
             # We'll monitor for a short time to make sure it starts properly, but won't keep monitoring
             await asyncio.sleep(0.5)  # Give browser time to start
@@ -7214,29 +10162,32 @@ class ManagedBrowser:
         return browser_path
 
     async def _get_browser_args(self) -> List[str]:
-        """Returns browser-specific command line arguments"""
-        base_args = [await self._get_browser_path()]
-
+        """Returns full CLI args for launching the browser"""
+        base = [await self._get_browser_path()]
         if self.browser_type == "chromium":
-            args = [
+            flags = [
                 f"--remote-debugging-port={self.debugging_port}",
                 f"--user-data-dir={self.user_data_dir}",
             ]
             if self.headless:
-                args.append("--headless=new")
+                flags.append("--headless=new")
+            # Add viewport flag if specified in config
+            if self.browser_config.viewport_height and self.browser_config.viewport_width:
+                flags.append(f"--window-size={self.browser_config.viewport_width},{self.browser_config.viewport_height}")
+            # merge common launch flags
+            flags.extend(self.build_browser_flags(self.browser_config))
         elif self.browser_type == "firefox":
-            args = [
+            flags = [
                 "--remote-debugging-port",
                 str(self.debugging_port),
                 "--profile",
                 self.user_data_dir,
             ]
             if self.headless:
-                args.append("--headless")
+                flags.append("--headless")
         else:
             raise NotImplementedError(f"Browser type {self.browser_type} not supported")
-
-        return base_args + args
+        return base + flags
 
     async def cleanup(self):
         """Cleanup browser process and temporary directory"""
@@ -7259,13 +10210,17 @@ class ManagedBrowser:
                     # Force kill if still running
                     if self.browser_process.poll() is None:
                         if sys.platform == "win32":
-                            # On Windows we might need taskkill for detached processes
+                            # On Windows, use taskkill /T to kill the entire process tree
                             try:
-                                subprocess.run(["taskkill", "/F", "/PID", str(self.browser_process.pid)])
+                                subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.browser_process.pid)])
                             except Exception:
                                 self.browser_process.kill()
                         else:
-                            self.browser_process.kill()
+                            # On Unix, kill entire process group to reap child processes
+                            try:
+                                os.killpg(os.getpgid(self.browser_process.pid), signal.SIGKILL)
+                            except (ProcessLookupError, OSError):
+                                pass
                         await asyncio.sleep(0.1)  # Brief wait for kill to take effect
 
             except Exception as e:
@@ -7358,6 +10313,141 @@ class ManagedBrowser:
         return profiler.delete_profile(profile_name_or_path)
 
 
+async def clone_runtime_state(
+    src: BrowserContext,
+    dst: BrowserContext,
+    crawlerRunConfig: CrawlerRunConfig | None = None,
+    browserConfig: BrowserConfig | None = None,
+) -> None:
+    """
+    Bring everything that *can* be changed at runtime from `src` → `dst`.
+
+    1. Cookies
+    2. localStorage (and sessionStorage, same API)
+    3. Extra headers, permissions, geolocation if supplied in configs
+    """
+
+    # ── 1. cookies ────────────────────────────────────────────────────────────
+    cookies = await src.cookies()
+    if cookies:
+        await dst.add_cookies(cookies)
+
+    # ── 2. localStorage / sessionStorage ──────────────────────────────────────
+    state = await src.storage_state()
+    for origin in state.get("origins", []):
+        url = origin["origin"]
+        kvs = origin.get("localStorage", [])
+        if not kvs:
+            continue
+
+        page = dst.pages[0] if dst.pages else await dst.new_page()
+        await page.goto(url, wait_until="domcontentloaded")
+        for k, v in kvs:
+            await page.evaluate("(k,v)=>localStorage.setItem(k,v)", k, v)
+
+    # ── 3. runtime-mutable extras from configs ────────────────────────────────
+    # headers
+    if browserConfig and browserConfig.headers:
+        await dst.set_extra_http_headers(browserConfig.headers)
+
+    # geolocation
+    if crawlerRunConfig and crawlerRunConfig.geolocation:
+        await dst.grant_permissions(["geolocation"])
+        await dst.set_geolocation(
+            {
+                "latitude": crawlerRunConfig.geolocation.latitude,
+                "longitude": crawlerRunConfig.geolocation.longitude,
+                "accuracy": crawlerRunConfig.geolocation.accuracy,
+            }
+        )
+        
+    return dst
+
+
+
+class _CDPConnectionCache:
+    """
+    Class-level cache for Playwright + CDP browser connections.
+
+    When enabled via BrowserConfig(cache_cdp_connection=True), multiple
+    BrowserManager instances connecting to the same cdp_url will share
+    a single Playwright subprocess and CDP WebSocket. Reference-counted;
+    the connection is closed when the last user releases it.
+    """
+
+    _cache: Dict[str, Tuple] = {}  # cdp_url -> (playwright, browser, ref_count)
+    _lock: Optional[asyncio.Lock] = None  # lazy-init to avoid event loop issues
+    _lock_loop: Optional[asyncio.AbstractEventLoop] = None
+
+    @classmethod
+    def _get_lock(cls) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        if cls._lock is None or cls._lock_loop is not loop:
+            cls._lock = asyncio.Lock()
+            cls._lock_loop = loop
+        return cls._lock
+
+    @classmethod
+    async def acquire(cls, cdp_url: str, use_undetected: bool = False):
+        """Get or create a cached (playwright, browser) for this cdp_url."""
+        async with cls._get_lock():
+            if cdp_url in cls._cache:
+                pw, browser, count = cls._cache[cdp_url]
+                if browser.is_connected():
+                    cls._cache[cdp_url] = (pw, browser, count + 1)
+                    return pw, browser
+                # Stale connection — clean up and fall through to create new
+                try:
+                    await pw.stop()
+                except Exception:
+                    pass
+                del cls._cache[cdp_url]
+
+            # Create new connection
+            if use_undetected:
+                from patchright.async_api import async_playwright
+            else:
+                from playwright.async_api import async_playwright
+            pw = await async_playwright().start()
+            browser = await pw.chromium.connect_over_cdp(cdp_url)
+            cls._cache[cdp_url] = (pw, browser, 1)
+            return pw, browser
+
+    @classmethod
+    async def release(cls, cdp_url: str):
+        """Decrement ref count; close connection when last user releases."""
+        async with cls._get_lock():
+            if cdp_url not in cls._cache:
+                return
+            pw, browser, count = cls._cache[cdp_url]
+            if count <= 1:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                try:
+                    await pw.stop()
+                except Exception:
+                    pass
+                del cls._cache[cdp_url]
+            else:
+                cls._cache[cdp_url] = (pw, browser, count - 1)
+
+    @classmethod
+    async def close_all(cls):
+        """Force-close all cached connections. Call on application shutdown."""
+        async with cls._get_lock():
+            for cdp_url in list(cls._cache.keys()):
+                pw, browser, _ = cls._cache[cdp_url]
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                try:
+                    await pw.stop()
+                except Exception:
+                    pass
+            cls._cache.clear()
 
 
 class BrowserManager:
@@ -7376,29 +10466,49 @@ class BrowserManager:
     """
 
     _playwright_instance = None
-    
+
+    # Class-level tracking of pages in use, keyed by browser endpoint (CDP URL or instance id)
+    # This ensures multiple BrowserManager instances connecting to the same browser
+    # share the same page tracking, preventing race conditions.
+    _global_pages_in_use: dict = {}  # endpoint_key -> set of pages
+    _global_pages_lock: asyncio.Lock = None  # Initialized lazily
+
     @classmethod
-    async def get_playwright(cls):
-        from playwright.async_api import async_playwright
+    def _get_global_lock(cls) -> asyncio.Lock:
+        """Get or create the global pages lock (lazy initialization for async context)."""
+        if cls._global_pages_lock is None:
+            cls._global_pages_lock = asyncio.Lock()
+        return cls._global_pages_lock
+
+    @classmethod
+    async def get_playwright(cls, use_undetected: bool = False):
+        if use_undetected:
+            from patchright.async_api import async_playwright
+        else:
+            from playwright.async_api import async_playwright
         cls._playwright_instance = await async_playwright().start()
         return cls._playwright_instance    
 
-    def __init__(self, browser_config: BrowserConfig, logger=None):
+    def __init__(self, browser_config: BrowserConfig, logger=None, use_undetected: bool = False):
         """
         Initialize the BrowserManager with a browser configuration.
 
         Args:
             browser_config (BrowserConfig): Configuration object containing all browser settings
             logger: Logger instance for recording events and errors
+            use_undetected (bool): Whether to use undetected browser (Patchright)
         """
         self.config: BrowserConfig = browser_config
         self.logger = logger
+        self.use_undetected = use_undetected
 
         # Browser state
         self.browser = None
         self.default_context = None
         self.managed_browser = None
         self.playwright = None
+        self._using_cached_cdp = False
+        self._launched_persistent = False  # True when using launch_persistent_context
 
         # Session management
         self.sessions = {}
@@ -7406,7 +10516,36 @@ class BrowserManager:
 
         # Keep track of contexts by a "config signature," so each unique config reuses a single context
         self.contexts_by_config = {}
-        self._contexts_lock = asyncio.Lock() 
+        self._contexts_lock = asyncio.Lock()
+
+        # Context lifecycle tracking for LRU eviction
+        self._context_refcounts = {}    # sig -> int  (active crawls using this context)
+        self._context_last_used = {}    # sig -> float (monotonic timestamp for LRU)
+        self._page_to_sig = {}          # page -> sig  (for decrement lookup on release)
+        self._max_contexts = 20         # LRU eviction threshold
+
+        # Serialize context.new_page() across concurrent tasks to avoid races
+        # when using a shared persistent context (context.pages may be empty
+        # for all racers). Prevents 'Target page/context closed' errors.
+        self._page_lock = asyncio.Lock()
+
+        # Browser endpoint key for global page tracking (set after browser starts)
+        self._browser_endpoint_key: Optional[str] = None
+
+        # Browser recycling state (version-based approach)
+        self._pages_served = 0
+        self._browser_version = 1  # included in signature, bump to create new browser
+        self._pending_cleanup = {}  # old_sig -> {"browser": browser, "contexts": [...], "done": Event}
+        self._pending_cleanup_lock = asyncio.Lock()
+        self._max_pending_browsers = 3  # safety cap — block if too many draining
+        self._cleanup_slot_available = asyncio.Event()
+        self._cleanup_slot_available.set()  # starts open
+
+        # Stealth adapter for stealth mode
+        self._stealth_adapter = None
+        if self.config.enable_stealth and not self.use_undetected:
+            from .browser_adapter import StealthAdapter
+            self._stealth_adapter = StealthAdapter()
 
         # Initialize ManagedBrowser if needed
         if self.config.use_managed_browser:
@@ -7434,17 +10573,138 @@ class BrowserManager:
         """
         if self.playwright is not None:
             await self.close()
-            
-        from playwright.async_api import async_playwright
 
-        self.playwright = await async_playwright().start()
+        # Use cached CDP connection if enabled and cdp_url is set
+        if self.config.cache_cdp_connection and self.config.cdp_url:
+            self._using_cached_cdp = True
+            self.config.use_managed_browser = True
+            self.playwright, self.browser = await _CDPConnectionCache.acquire(
+                self.config.cdp_url, self.use_undetected
+            )
+        else:
+            self._using_cached_cdp = False
+            if self.use_undetected:
+                from patchright.async_api import async_playwright
+            else:
+                from playwright.async_api import async_playwright
+
+            # Initialize playwright
+            self.playwright = await async_playwright().start()
+
+        # ── Persistent context via Playwright's native API ──────────────
+        # When use_persistent_context is set and we're not connecting to an
+        # external CDP endpoint, use launch_persistent_context() instead of
+        # subprocess + CDP.  This properly supports proxy authentication
+        # (server + username + password) which the --proxy-server CLI flag
+        # cannot handle.
+        if (
+            self.config.use_persistent_context
+            and not self.config.cdp_url
+            and not self._using_cached_cdp
+        ):
+            # Collect stealth / optimization CLI flags, excluding ones that
+            # launch_persistent_context handles via keyword arguments.
+            _skip_prefixes = (
+                "--proxy-server",
+                "--remote-debugging-port",
+                "--user-data-dir",
+                "--headless",
+                "--window-size",
+            )
+            cli_args = [
+                flag
+                for flag in ManagedBrowser.build_browser_flags(self.config)
+                if not flag.startswith(_skip_prefixes)
+            ]
+            if self.config.extra_args:
+                cli_args.extend(self.config.extra_args)
+
+            launch_kwargs = {
+                "headless": self.config.headless,
+                "args": list(dict.fromkeys(cli_args)),  # dedupe
+                "viewport": {
+                    "width": self.config.viewport_width,
+                    "height": self.config.viewport_height,
+                },
+                "user_agent": self.config.user_agent or None,
+                "ignore_https_errors": self.config.ignore_https_errors,
+                "accept_downloads": self.config.accept_downloads,
+            }
+
+            if self.config.proxy_config:
+                launch_kwargs["proxy"] = {
+                    "server": self.config.proxy_config.server,
+                    "username": self.config.proxy_config.username,
+                    "password": self.config.proxy_config.password,
+                }
+
+            if self.config.storage_state:
+                launch_kwargs["storage_state"] = self.config.storage_state
+
+            user_data_dir = self.config.user_data_dir or tempfile.mkdtemp(
+                prefix="crawl4ai-persistent-"
+            )
+
+            self.default_context = (
+                await self.playwright.chromium.launch_persistent_context(
+                    user_data_dir, **launch_kwargs
+                )
+            )
+            self.browser = None  # persistent context has no separate Browser
+            self._launched_persistent = True
+
+            await self.setup_context(self.default_context)
+
+            # Set the browser endpoint key for global page tracking
+            self._browser_endpoint_key = self._compute_browser_endpoint_key()
+            if self._browser_endpoint_key not in BrowserManager._global_pages_in_use:
+                BrowserManager._global_pages_in_use[self._browser_endpoint_key] = set()
+            return
 
         if self.config.cdp_url or self.config.use_managed_browser:
             self.config.use_managed_browser = True
-            cdp_url = await self.managed_browser.start() if not self.config.cdp_url else self.config.cdp_url
-            self.browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
+
+            if not self._using_cached_cdp:
+                cdp_url = await self.managed_browser.start() if not self.config.cdp_url else self.config.cdp_url
+
+                # Add CDP endpoint verification before connecting
+                if not await self._verify_cdp_ready(cdp_url):
+                    raise Exception(f"CDP endpoint at {cdp_url} is not ready after startup")
+
+                self.browser = await self.playwright.chromium.connect_over_cdp(cdp_url)
+
             contexts = self.browser.contexts
-            if contexts:
+
+            # If browser_context_id is provided, we're using a pre-created context
+            if self.config.browser_context_id:
+                if self.logger:
+                    self.logger.debug(
+                        f"Using pre-existing browser context: {self.config.browser_context_id}",
+                        tag="BROWSER"
+                    )
+                # When connecting to a pre-created context, it should be in contexts
+                if contexts:
+                    self.default_context = contexts[0]
+                    if self.logger:
+                        self.logger.debug(
+                            f"Found {len(contexts)} existing context(s), using first one",
+                            tag="BROWSER"
+                        )
+                else:
+                    # Context was created but not yet visible - wait a bit
+                    await asyncio.sleep(0.2)
+                    contexts = self.browser.contexts
+                    if contexts:
+                        self.default_context = contexts[0]
+                    else:
+                        # Still no contexts - this shouldn't happen with pre-created context
+                        if self.logger:
+                            self.logger.warning(
+                                "Pre-created context not found, creating new one",
+                                tag="BROWSER"
+                            )
+                        self.default_context = await self.create_browser_context()
+            elif contexts:
                 self.default_context = contexts[0]
             else:
                 self.default_context = await self.create_browser_context()
@@ -7462,6 +10722,120 @@ class BrowserManager:
 
             self.default_context = self.browser
 
+        # Set the browser endpoint key for global page tracking
+        self._browser_endpoint_key = self._compute_browser_endpoint_key()
+        # Initialize global tracking set for this endpoint if needed
+        if self._browser_endpoint_key not in BrowserManager._global_pages_in_use:
+            BrowserManager._global_pages_in_use[self._browser_endpoint_key] = set()
+
+    def _compute_browser_endpoint_key(self) -> str:
+        """
+        Compute a unique key identifying this browser connection.
+
+        For CDP connections, uses the normalized CDP URL so all BrowserManager
+        instances connecting to the same browser share page tracking.
+        For standalone browsers, uses instance id since each is independent.
+
+        Returns:
+            str: Unique identifier for this browser connection
+        """
+        # For CDP connections, use the CDP URL as the key (normalized)
+        if self.config.cdp_url:
+            return self._normalize_cdp_url(self.config.cdp_url)
+
+        # For managed browsers, use the CDP URL/port that was assigned
+        if self.managed_browser:
+            # Use debugging port as the key since it uniquely identifies the browser
+            port = getattr(self.managed_browser, 'debugging_port', None)
+            host = getattr(self.managed_browser, 'host', 'localhost')
+            if port:
+                return f"cdp:http://{host}:{port}"
+
+        # For standalone browsers, use instance id (no sharing needed)
+        return f"instance:{id(self)}"
+
+    def _normalize_cdp_url(self, cdp_url: str) -> str:
+        """
+        Normalize a CDP URL to a canonical form for consistent tracking.
+
+        Handles various formats:
+        - http://localhost:9222
+        - ws://localhost:9222/devtools/browser/xxx
+        - http://localhost:9222?browser_id=xxx
+
+        Returns:
+            str: Normalized CDP key in format "cdp:http://host:port"
+        """
+        from urllib.parse import urlparse
+
+        parsed = urlparse(cdp_url)
+        host = parsed.hostname or 'localhost'
+        port = parsed.port or 9222
+
+        return f"cdp:http://{host}:{port}"
+
+    def _get_pages_in_use(self) -> set:
+        """Get the set of pages currently in use for this browser."""
+        if self._browser_endpoint_key and self._browser_endpoint_key in BrowserManager._global_pages_in_use:
+            return BrowserManager._global_pages_in_use[self._browser_endpoint_key]
+        # Fallback: shouldn't happen, but return empty set
+        return set()
+
+    def _mark_page_in_use(self, page) -> None:
+        """Mark a page as in use."""
+        if self._browser_endpoint_key:
+            if self._browser_endpoint_key not in BrowserManager._global_pages_in_use:
+                BrowserManager._global_pages_in_use[self._browser_endpoint_key] = set()
+            BrowserManager._global_pages_in_use[self._browser_endpoint_key].add(page)
+
+    def _release_page_from_use(self, page) -> None:
+        """Release a page from the in-use tracking."""
+        if self._browser_endpoint_key and self._browser_endpoint_key in BrowserManager._global_pages_in_use:
+            BrowserManager._global_pages_in_use[self._browser_endpoint_key].discard(page)
+
+    async def _verify_cdp_ready(self, cdp_url: str) -> bool:
+        """Verify CDP endpoint is ready with exponential backoff.
+
+        Supports multiple URL formats:
+        - HTTP URLs: http://localhost:9222
+        - HTTP URLs with query params: http://localhost:9222?browser_id=XXX
+        - WebSocket URLs: ws://localhost:9222/devtools/browser/XXX
+        """
+        import aiohttp
+        from urllib.parse import urlparse, urlunparse
+
+        # If WebSocket URL, Playwright handles connection directly - skip HTTP verification
+        if cdp_url.startswith(('ws://', 'wss://')):
+            self.logger.debug(f"WebSocket CDP URL provided, skipping HTTP verification", tag="BROWSER")
+            return True
+
+        # Parse HTTP URL and properly construct /json/version endpoint
+        parsed = urlparse(cdp_url)
+        # Build URL with /json/version path, preserving query params
+        verify_url = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            '/json/version',  # Always use this path for verification
+            '',  # params
+            parsed.query,  # preserve query string
+            ''   # fragment
+        ))
+
+        self.logger.debug(f"Starting CDP verification for {verify_url}", tag="BROWSER")
+        for attempt in range(5):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(verify_url, timeout=aiohttp.ClientTimeout(total=2)) as response:
+                        if response.status == 200:
+                            self.logger.debug(f"CDP endpoint ready after {attempt + 1} attempts", tag="BROWSER")
+                            return True
+            except Exception as e:
+                self.logger.debug(f"CDP check attempt {attempt + 1} failed: {e}", tag="BROWSER")
+            delay = 0.5 * (1.4 ** attempt)
+            self.logger.debug(f"Waiting {delay:.2f}s before next CDP check...", tag="BROWSER")
+            await asyncio.sleep(delay)
+        self.logger.debug(f"CDP verification failed after 5 attempts", tag="BROWSER")
+        return False
 
     def _build_browser_args(self) -> dict:
         """Build browser launch arguments from config."""
@@ -7484,9 +10858,19 @@ class BrowserManager:
             "--force-color-profile=srgb",
             "--mute-audio",
             "--disable-background-timer-throttling",
+            # Memory-saving flags: disable unused Chrome features
+            "--disable-features=OptimizationHints,MediaRouter,DialMediaRouteProvider",
+            "--disable-component-update",
+            "--disable-domain-reliability",
             # "--single-process",
             f"--window-size={self.config.viewport_width},{self.config.viewport_height}",
         ]
+
+        if self.config.memory_saving_mode:
+            args.extend([
+                "--aggressive-cache-discard",
+                '--js-flags=--max-old-space-size=512',
+            ])
 
         if self.config.light_mode:
             args.extend(BROWSER_DISABLE_OPTIONS)
@@ -7598,18 +10982,27 @@ class BrowserManager:
             combined_headers.update(self.config.headers)
             await context.set_extra_http_headers(combined_headers)
 
-        # Add default cookie
-        await context.add_cookies(
-            [
-                {
-                    "name": "cookiesEnabled",
-                    "value": "true",
-                    "url": crawlerRunConfig.url
-                    if crawlerRunConfig and crawlerRunConfig.url
-                    else "https://crawl4ai.com/",
-                }
-            ]
-        )
+        # Add default cookie (skip for raw:/file:// URLs which are not valid cookie URLs)
+        cookie_url = None
+        if crawlerRunConfig and crawlerRunConfig.url:
+            url = crawlerRunConfig.url
+            # Only set cookie for http/https URLs
+            if url.startswith(("http://", "https://")):
+                cookie_url = url
+            elif crawlerRunConfig.base_url and crawlerRunConfig.base_url.startswith(("http://", "https://")):
+                # Use base_url as fallback for raw:/file:// URLs
+                cookie_url = crawlerRunConfig.base_url
+
+        if cookie_url:
+            await context.add_cookies(
+                [
+                    {
+                        "name": "cookiesEnabled",
+                        "value": "true",
+                        "url": cookie_url,
+                    }
+                ]
+            )
 
         # Handle navigator overrides
         if crawlerRunConfig:
@@ -7618,7 +11011,23 @@ class BrowserManager:
                 or crawlerRunConfig.simulate_user
                 or crawlerRunConfig.magic
             ):
-                await context.add_init_script(load_js_script("navigator_overrider"))        
+                await context.add_init_script(load_js_script("navigator_overrider"))
+                context._crawl4ai_nav_overrider_injected = True
+
+        # Force-open closed shadow roots when flatten_shadow_dom is enabled
+        if crawlerRunConfig and crawlerRunConfig.flatten_shadow_dom:
+            await context.add_init_script("""
+                const _origAttachShadow = Element.prototype.attachShadow;
+                Element.prototype.attachShadow = function(init) {
+                    return _origAttachShadow.call(this, {...init, mode: 'open'});
+                };
+            """)
+            context._crawl4ai_shadow_dom_injected = True
+
+        # Apply custom init_scripts from BrowserConfig (for stealth evasions, etc.)
+        if self.config.init_scripts:
+            for script in self.config.init_scripts:
+                await context.add_init_script(script)
 
     async def create_browser_context(self, crawlerRunConfig: CrawlerRunConfig = None):
         """
@@ -7628,6 +11037,18 @@ class BrowserManager:
         Returns:
             Context: Browser context object with the specified configurations
         """
+        if self.browser is None:
+            if self._launched_persistent:
+                raise RuntimeError(
+                    "Cannot create new browser contexts when using "
+                    "use_persistent_context=True. Persistent context uses a "
+                    "single shared context."
+                )
+            raise RuntimeError(
+                "Browser is not available. It may have been closed, crashed, "
+                "or not yet started. Ensure the browser is running before "
+                "creating new contexts."
+            )
         # Base settings
         user_agent = self.config.headers.get("User-Agent", self.config.user_agent) 
         viewport_settings = {
@@ -7636,59 +11057,47 @@ class BrowserManager:
         }
         proxy_settings = {"server": self.config.proxy} if self.config.proxy else None
 
-        blocked_extensions = [
+        # CSS extensions (blocked separately via avoid_css flag)
+        css_extensions = ["css", "less", "scss", "sass"]
+
+        # Static resource extensions (blocked when text_mode is enabled)
+        static_extensions = [
             # Images
-            "jpg",
-            "jpeg",
-            "png",
-            "gif",
-            "webp",
-            "svg",
-            "ico",
-            "bmp",
-            "tiff",
-            "psd",
+            "jpg", "jpeg", "png", "gif", "webp", "svg", "ico", "bmp", "tiff", "psd",
             # Fonts
-            "woff",
-            "woff2",
-            "ttf",
-            "otf",
-            "eot",
-            # Styles
-            # 'css', 'less', 'scss', 'sass',
+            "woff", "woff2", "ttf", "otf", "eot",
             # Media
-            "mp4",
-            "webm",
-            "ogg",
-            "avi",
-            "mov",
-            "wmv",
-            "flv",
-            "m4v",
-            "mp3",
-            "wav",
-            "aac",
-            "m4a",
-            "opus",
-            "flac",
+            "mp4", "webm", "ogg", "avi", "mov", "wmv", "flv", "m4v",
+            "mp3", "wav", "aac", "m4a", "opus", "flac",
             # Documents
-            "pdf",
-            "doc",
-            "docx",
-            "xls",
-            "xlsx",
-            "ppt",
-            "pptx",
+            "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
             # Archives
-            "zip",
-            "rar",
-            "7z",
-            "tar",
-            "gz",
+            "zip", "rar", "7z", "tar", "gz",
             # Scripts and data
-            "xml",
-            "swf",
-            "wasm",
+            "xml", "swf", "wasm",
+        ]
+
+        # Ad and tracker domain patterns (curated from uBlock/EasyList sources)
+        ad_tracker_patterns = [
+            "**/google-analytics.com/**",
+            "**/googletagmanager.com/**",
+            "**/googlesyndication.com/**",
+            "**/doubleclick.net/**",
+            "**/adservice.google.com/**",
+            "**/adsystem.com/**",
+            "**/adzerk.net/**",
+            "**/adnxs.com/**",
+            "**/ads.linkedin.com/**",
+            "**/facebook.net/**",
+            "**/analytics.twitter.com/**",
+            "**/ads-twitter.com/**",
+            "**/hotjar.com/**",
+            "**/clarity.ms/**",
+            "**/scorecardresearch.com/**",
+            "**/pixel.wp.com/**",
+            "**/amazon-adsystem.com/**",
+            "**/mixpanel.com/**",
+            "**/segment.com/**",
         ]
 
         # Common context settings
@@ -7706,14 +11115,12 @@ class BrowserManager:
         if crawlerRunConfig:
             # Check if there is value for crawlerRunConfig.proxy_config set add that to context
             if crawlerRunConfig.proxy_config:
-                proxy_settings = {
-                    "server": crawlerRunConfig.proxy_config.server,
-                }
-                if crawlerRunConfig.proxy_config.username:
-                    proxy_settings.update({
-                        "username": crawlerRunConfig.proxy_config.username,
-                        "password": crawlerRunConfig.proxy_config.password,
-                    })
+                from playwright.async_api import ProxySettings
+                proxy_settings = ProxySettings(
+                    server=crawlerRunConfig.proxy_config.server,
+                    username=crawlerRunConfig.proxy_config.username,
+                    password=crawlerRunConfig.proxy_config.password,
+                )
                 context_settings["proxy"] = proxy_settings
 
         if self.config.text_mode:
@@ -7724,47 +11131,204 @@ class BrowserManager:
             # Update context settings with text mode settings
             context_settings.update(text_mode_settings)
 
+        # inject locale / tz / geo if user provided them
+        if crawlerRunConfig:
+            if crawlerRunConfig.locale:
+                context_settings["locale"] = crawlerRunConfig.locale
+            if crawlerRunConfig.timezone_id:
+                context_settings["timezone_id"] = crawlerRunConfig.timezone_id
+            if crawlerRunConfig.geolocation:
+                context_settings["geolocation"] = {
+                    "latitude": crawlerRunConfig.geolocation.latitude,
+                    "longitude": crawlerRunConfig.geolocation.longitude,
+                    "accuracy": crawlerRunConfig.geolocation.accuracy,
+                }
+                # ensure geolocation permission
+                perms = context_settings.get("permissions", [])
+                perms.append("geolocation")
+                context_settings["permissions"] = perms
+
         # Create and return the context with all settings
         context = await self.browser.new_context(**context_settings)
 
-        # Apply text mode settings if enabled
+        # Build dynamic blocking list based on config flags
+        to_block = []
+        if self.config.avoid_css:
+            to_block.extend(css_extensions)
         if self.config.text_mode:
-            # Create and apply route patterns for each extension
-            for ext in blocked_extensions:
+            to_block.extend(static_extensions)
+
+        if to_block:
+            for ext in to_block:
                 await context.route(f"**/*.{ext}", lambda route: route.abort())
+
+        if self.config.avoid_ads:
+            for pattern in ad_tracker_patterns:
+                await context.route(pattern, lambda route: route.abort())
+
+        # TODO: Strip infrastructure-injected headers that leak datacenter origin
+        # (e.g. X-Amzn-Trace-Id from AWS ALB, X-Forwarded-For from proxies).
+        # These headers tell Cloudflare the request comes from a datacenter.
+        # Uncomment when confirmed that stripping helps bypass anti-bot:
+        #
+        # _leaky_headers = {"x-amzn-trace-id", "x-forwarded-for", "x-envoy-external-address"}
+        # async def _strip_leaky_headers(route):
+        #     headers = {k: v for k, v in route.request.headers.items()
+        #                if k.lower() not in _leaky_headers}
+        #     await route.continue_(headers=headers)
+        # await context.route("**/*", _strip_leaky_headers)
+
         return context
 
     def _make_config_signature(self, crawlerRunConfig: CrawlerRunConfig) -> str:
         """
-        Converts the crawlerRunConfig into a dict, excludes ephemeral fields,
-        then returns a hash of the sorted JSON. This yields a stable signature
-        that identifies configurations requiring a unique browser context.
+        Hash ONLY the CrawlerRunConfig fields that affect browser context
+        creation (create_browser_context) or context setup (setup_context).
+
+        Whitelist approach: fields like css_selector, word_count_threshold,
+        screenshot, verbose, etc. do NOT cause a new context to be created.
         """
         import json
 
-        config_dict = crawlerRunConfig.__dict__.copy()
-        # Exclude items that do not affect browser-level setup.
-        # Expand or adjust as needed, e.g. chunking_strategy is purely for data extraction, not for browser config.
-        ephemeral_keys = [
-            "session_id",
-            "js_code",
-            "scraping_strategy",
-            "extraction_strategy",
-            "chunking_strategy",
-            "cache_mode",
-            "content_filter",
-            "semaphore_count",
-            "url"
-        ]
-        for key in ephemeral_keys:
-            if key in config_dict:
-                del config_dict[key]
-        # Convert to canonical JSON string
-        signature_json = json.dumps(config_dict, sort_keys=True, default=str)
+        sig_dict = {}
 
-        # Hash the JSON so we get a compact, unique string
-        signature_hash = hashlib.sha256(signature_json.encode("utf-8")).hexdigest()
-        return signature_hash
+        # Fields that flow into create_browser_context()
+        pc = crawlerRunConfig.proxy_config
+        if pc is not None:
+            sig_dict["proxy_config"] = {
+                "server": getattr(pc, "server", None),
+                "username": getattr(pc, "username", None),
+                "password": getattr(pc, "password", None),
+            }
+        else:
+            sig_dict["proxy_config"] = None
+
+        sig_dict["locale"] = crawlerRunConfig.locale
+        sig_dict["timezone_id"] = crawlerRunConfig.timezone_id
+
+        geo = crawlerRunConfig.geolocation
+        if geo is not None:
+            sig_dict["geolocation"] = {
+                "latitude": geo.latitude,
+                "longitude": geo.longitude,
+                "accuracy": geo.accuracy,
+            }
+        else:
+            sig_dict["geolocation"] = None
+
+        # Fields that flow into setup_context() as init scripts
+        sig_dict["override_navigator"] = crawlerRunConfig.override_navigator
+        sig_dict["simulate_user"] = crawlerRunConfig.simulate_user
+        sig_dict["magic"] = crawlerRunConfig.magic
+
+        # Browser version — bumped on recycle to force new browser instance
+        sig_dict["_browser_version"] = self._browser_version
+
+        signature_json = json.dumps(sig_dict, sort_keys=True, default=str)
+        return hashlib.sha256(signature_json.encode("utf-8")).hexdigest()
+
+    def _evict_lru_context_locked(self):
+        """
+        If contexts exceed the limit, find the least-recently-used context
+        with zero active crawls and remove it from all tracking dicts.
+
+        MUST be called while holding self._contexts_lock.
+
+        Returns the BrowserContext to close (caller closes it OUTSIDE the
+        lock), or None if no eviction is needed or possible.
+        """
+        if len(self.contexts_by_config) <= self._max_contexts:
+            return None
+
+        # Sort candidates by last-used timestamp (oldest first)
+        candidates = sorted(
+            self._context_last_used.items(),
+            key=lambda item: item[1],
+        )
+        for evict_sig, _ in candidates:
+            if self._context_refcounts.get(evict_sig, 0) == 0:
+                ctx = self.contexts_by_config.pop(evict_sig, None)
+                self._context_refcounts.pop(evict_sig, None)
+                self._context_last_used.pop(evict_sig, None)
+                # Clean up stale page->sig mappings for evicted context
+                stale_pages = [
+                    p for p, s in self._page_to_sig.items() if s == evict_sig
+                ]
+                for p in stale_pages:
+                    del self._page_to_sig[p]
+                return ctx
+
+        # All contexts are in active use — cannot evict
+        return None
+
+    async def _apply_stealth_to_page(self, page):
+        """Apply stealth to a page if stealth mode is enabled"""
+        if self._stealth_adapter:
+            try:
+                await self._stealth_adapter.apply_stealth(page)
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(
+                        message="Failed to apply stealth to page: {error}",
+                        tag="STEALTH",
+                        params={"error": str(e)}
+                    )
+
+    async def _get_page_by_target_id(self, context: BrowserContext, target_id: str):
+        """
+        Get an existing page by its CDP target ID.
+
+        This is used when connecting to a pre-created browser context with an existing page.
+        Playwright may not immediately see targets created via raw CDP commands, so we
+        use CDP to get all targets and find the matching one.
+
+        Args:
+            context: The browser context to search in
+            target_id: The CDP target ID to find
+
+        Returns:
+            Page object if found, None otherwise
+        """
+        try:
+            # First check if Playwright already sees the page
+            for page in context.pages:
+                # Playwright's internal target ID might match
+                if hasattr(page, '_impl_obj') and hasattr(page._impl_obj, '_target_id'):
+                    if page._impl_obj._target_id == target_id:
+                        return page
+
+            # If not found, try using CDP to get targets
+            if hasattr(self.browser, '_impl_obj') and hasattr(self.browser._impl_obj, '_connection'):
+                cdp_session = await context.new_cdp_session(context.pages[0] if context.pages else None)
+                if cdp_session:
+                    try:
+                        result = await cdp_session.send("Target.getTargets")
+                        targets = result.get("targetInfos", [])
+                        for target in targets:
+                            if target.get("targetId") == target_id:
+                                # Found the target - if it's a page type, we can use it
+                                if target.get("type") == "page":
+                                    # The page exists, let Playwright discover it
+                                    await asyncio.sleep(0.1)
+                                    # Refresh pages list
+                                    if context.pages:
+                                        return context.pages[0]
+                    finally:
+                        await cdp_session.detach()
+
+            # Fallback: if there are any pages now, return the first one
+            if context.pages:
+                return context.pages[0]
+
+            return None
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(
+                    message="Failed to get page by target ID: {error}",
+                    tag="BROWSER",
+                    params={"error": str(e)}
+                )
+            return None
 
     async def get_page(self, crawlerRunConfig: CrawlerRunConfig):
         """
@@ -7787,14 +11351,112 @@ class BrowserManager:
 
         # If using a managed browser, just grab the shared default_context
         if self.config.use_managed_browser:
-            context = self.default_context
-            pages = context.pages
-            page = next((p for p in pages if p.url == crawlerRunConfig.url), None)
-            if not page:
-                page = await context.new_page()
+            # If create_isolated_context is True, create isolated contexts for concurrent crawls
+            # Uses the same caching mechanism as non-CDP mode: cache context by config signature,
+            # but always create a new page. This prevents navigation conflicts while allowing
+            # context reuse for multiple URLs with the same config (e.g., batch/deep crawls).
+            if self.config.create_isolated_context:
+                config_signature = self._make_config_signature(crawlerRunConfig)
+                to_close = None
+
+                async with self._contexts_lock:
+                    if config_signature in self.contexts_by_config:
+                        context = self.contexts_by_config[config_signature]
+                    else:
+                        context = await self.create_browser_context(crawlerRunConfig)
+                        await self.setup_context(context, crawlerRunConfig)
+                        self.contexts_by_config[config_signature] = context
+                        self._context_refcounts[config_signature] = 0
+                        to_close = self._evict_lru_context_locked()
+
+                    # Increment refcount INSIDE lock before releasing
+                    self._context_refcounts[config_signature] = (
+                        self._context_refcounts.get(config_signature, 0) + 1
+                    )
+                    self._context_last_used[config_signature] = time.monotonic()
+
+                # Close evicted context OUTSIDE lock
+                if to_close is not None:
+                    try:
+                        await to_close.close()
+                    except Exception:
+                        pass
+
+                # Always create a new page for each crawl (isolation for navigation)
+                try:
+                    page = await context.new_page()
+                except Exception:
+                    async with self._contexts_lock:
+                        if config_signature in self._context_refcounts:
+                            self._context_refcounts[config_signature] = max(
+                                0, self._context_refcounts[config_signature] - 1
+                            )
+                    raise
+                await self._apply_stealth_to_page(page)
+                self._page_to_sig[page] = config_signature
+            elif self.config.storage_state:
+                tmp_context = await self.create_browser_context(crawlerRunConfig)
+                ctx = self.default_context        # default context, one window only
+                ctx = await clone_runtime_state(tmp_context, ctx, crawlerRunConfig, self.config)
+                # Close the temporary context — only needed as a clone source
+                try:
+                    await tmp_context.close()
+                except Exception:
+                    pass
+                context = ctx  # so (page, context) return value is correct
+                # Avoid concurrent new_page on shared persistent context
+                # See GH-1198: context.pages can be empty under races
+                async with self._page_lock:
+                    page = await ctx.new_page()
+                await self._apply_stealth_to_page(page)
+            else:
+                context = self.default_context
+
+                # Handle pre-existing target case (for reconnecting to specific CDP targets)
+                if self.config.browser_context_id and self.config.target_id:
+                    page = await self._get_page_by_target_id(context, self.config.target_id)
+                    if not page:
+                        async with self._page_lock:
+                            page = await context.new_page()
+                            self._mark_page_in_use(page)
+                        await self._apply_stealth_to_page(page)
+                    else:
+                        # Mark pre-existing target as in use
+                        self._mark_page_in_use(page)
+                else:
+                    # For CDP connections (external browser), multiple Playwright connections
+                    # create separate browser/context objects. Page reuse across connections
+                    # isn't reliable because each connection sees different page objects.
+                    # Always create new pages for CDP to avoid cross-connection race conditions.
+                    if self.config.cdp_url and not self.config.use_managed_browser:
+                        async with self._page_lock:
+                            page = await context.new_page()
+                            self._mark_page_in_use(page)
+                        await self._apply_stealth_to_page(page)
+                    else:
+                        # For managed browsers (single process), page reuse is safe.
+                        # Use lock to safely check for available pages and track usage.
+                        # This prevents race conditions when multiple crawls run concurrently.
+                        async with BrowserManager._get_global_lock():
+                            pages = context.pages
+                            pages_in_use = self._get_pages_in_use()
+                            # Find first available page (exists and not currently in use)
+                            available_page = next(
+                                (p for p in pages if p not in pages_in_use),
+                                None
+                            )
+                            if available_page:
+                                page = available_page
+                            else:
+                                # No available pages - create a new one
+                                page = await context.new_page()
+                                await self._apply_stealth_to_page(page)
+                            # Mark page as in use (global tracking)
+                            self._mark_page_in_use(page)
         else:
             # Otherwise, check if we have an existing context for this config
             config_signature = self._make_config_signature(crawlerRunConfig)
+            to_close = None
 
             async with self._contexts_lock:
                 if config_signature in self.contexts_by_config:
@@ -7804,13 +11466,44 @@ class BrowserManager:
                     context = await self.create_browser_context(crawlerRunConfig)
                     await self.setup_context(context, crawlerRunConfig)
                     self.contexts_by_config[config_signature] = context
+                    self._context_refcounts[config_signature] = 0
+                    to_close = self._evict_lru_context_locked()
+
+                # Increment refcount INSIDE lock before releasing
+                self._context_refcounts[config_signature] = (
+                    self._context_refcounts.get(config_signature, 0) + 1
+                )
+                self._context_last_used[config_signature] = time.monotonic()
+
+            # Close evicted context OUTSIDE lock
+            if to_close is not None:
+                try:
+                    await to_close.close()
+                except Exception:
+                    pass
 
             # Create a new page from the chosen context
-            page = await context.new_page()
+            try:
+                page = await context.new_page()
+            except Exception:
+                async with self._contexts_lock:
+                    if config_signature in self._context_refcounts:
+                        self._context_refcounts[config_signature] = max(
+                            0, self._context_refcounts[config_signature] - 1
+                        )
+                raise
+            await self._apply_stealth_to_page(page)
+            self._page_to_sig[page] = config_signature
 
         # If a session_id is specified, store this session so we can reuse later
         if crawlerRunConfig.session_id:
             self.sessions[crawlerRunConfig.session_id] = (context, page, time.time())
+
+        self._pages_served += 1
+
+        # Check if browser recycle threshold is hit — bump version for next requests
+        # This happens AFTER incrementing counter so concurrent requests see correct count
+        await self._maybe_bump_browser_version()
 
         return page, context
 
@@ -7823,10 +11516,234 @@ class BrowserManager:
         """
         if session_id in self.sessions:
             context, page, _ = self.sessions[session_id]
+            self._release_page_from_use(page)
+            # Decrement context refcount for the session's page
+            should_close_context = False
+            async with self._contexts_lock:
+                sig = self._page_to_sig.pop(page, None)
+                if sig is not None and sig in self._context_refcounts:
+                    self._context_refcounts[sig] = max(
+                        0, self._context_refcounts[sig] - 1
+                    )
+                    # Only close the context if no other pages are using it
+                    # (refcount dropped to 0) AND we own the context (not managed)
+                    if not self.config.use_managed_browser:
+                        if self._context_refcounts.get(sig, 0) == 0:
+                            self.contexts_by_config.pop(sig, None)
+                            self._context_refcounts.pop(sig, None)
+                            self._context_last_used.pop(sig, None)
+                            should_close_context = True
             await page.close()
-            if not self.config.use_managed_browser:
+            if should_close_context:
                 await context.close()
             del self.sessions[session_id]
+
+    def release_page(self, page):
+        """
+        Release a page from the in-use tracking set (global tracking).
+        Sync variant — does NOT decrement context refcount.
+        """
+        self._release_page_from_use(page)
+
+    async def release_page_with_context(self, page):
+        """
+        Release a page and decrement its context's refcount under the lock.
+
+        Should be called from the async crawl finally block instead of
+        release_page() so the context lifecycle is properly tracked.
+        """
+        self._release_page_from_use(page)
+        sig = None
+        refcount = -1
+        async with self._contexts_lock:
+            sig = self._page_to_sig.pop(page, None)
+            if sig is not None and sig in self._context_refcounts:
+                self._context_refcounts[sig] = max(
+                    0, self._context_refcounts[sig] - 1
+                )
+                refcount = self._context_refcounts[sig]
+
+        # Check if this signature belongs to an old browser waiting to be cleaned up
+        if sig is not None and refcount == 0:
+            await self._maybe_cleanup_old_browser(sig)
+
+    def _should_recycle(self) -> bool:
+        """Check if page threshold reached for browser recycling."""
+        limit = self.config.max_pages_before_recycle
+        if limit <= 0:
+            return False
+        return self._pages_served >= limit
+
+    async def _maybe_bump_browser_version(self):
+        """Bump browser version if threshold reached, moving old browser to pending cleanup.
+
+        New requests automatically get a new browser (via new signature).
+        Old browser drains naturally and gets cleaned up when refcount hits 0.
+        """
+        if not self._should_recycle():
+            return
+
+        # Safety cap: wait if too many old browsers are draining
+        while True:
+            async with self._pending_cleanup_lock:
+                # Re-check threshold under lock (another request may have bumped already)
+                if not self._should_recycle():
+                    return
+
+                # Check safety cap
+                if len(self._pending_cleanup) >= self._max_pending_browsers:
+                    if self.logger:
+                        self.logger.debug(
+                            message="Waiting for old browser to drain (pending: {count})",
+                            tag="BROWSER",
+                            params={"count": len(self._pending_cleanup)},
+                        )
+                    self._cleanup_slot_available.clear()
+                    # Release lock and wait
+                else:
+                    # We have a slot — do the bump inside this lock hold
+                    old_version = self._browser_version
+                    active_sigs = []
+                    idle_sigs = []
+                    async with self._contexts_lock:
+                        for sig in list(self._context_refcounts.keys()):
+                            if self._context_refcounts.get(sig, 0) > 0:
+                                active_sigs.append(sig)
+                            else:
+                                idle_sigs.append(sig)
+
+                    if self.logger:
+                        self.logger.info(
+                            message="Bumping browser version {old} -> {new} after {count} pages ({active} active, {idle} idle sigs)",
+                            tag="BROWSER",
+                            params={
+                                "old": old_version,
+                                "new": old_version + 1,
+                                "count": self._pages_served,
+                                "active": len(active_sigs),
+                                "idle": len(idle_sigs),
+                            },
+                        )
+
+                    # Only add sigs with active crawls to pending cleanup.
+                    # Sigs with refcount 0 are cleaned up immediately below
+                    # to avoid them being stuck in _pending_cleanup forever
+                    # (no future release would trigger their cleanup).
+                    done_event = asyncio.Event()
+                    for sig in active_sigs:
+                        self._pending_cleanup[sig] = {
+                            "version": old_version,
+                            "done": done_event,
+                        }
+
+                    # Bump version — new get_page() calls will create new contexts
+                    self._browser_version += 1
+                    self._pages_served = 0
+
+                    # Clean up idle sigs immediately (outside pending_cleanup_lock below)
+                    break  # exit while loop to do cleanup outside locks
+
+            # Safety cap path: wait for a cleanup slot, then retry.
+            # Timeout prevents permanent deadlock if stuck entries never drain.
+            try:
+                await asyncio.wait_for(
+                    self._cleanup_slot_available.wait(), timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                # Force-clean any pending entries that have refcount 0
+                # (they're stuck and will never drain naturally)
+                async with self._pending_cleanup_lock:
+                    stuck_sigs = [
+                        s for s in list(self._pending_cleanup.keys())
+                        if self._context_refcounts.get(s, 0) == 0
+                    ]
+                    for sig in stuck_sigs:
+                        self._pending_cleanup.pop(sig, None)
+                    if stuck_sigs:
+                        if self.logger:
+                            self.logger.warning(
+                                message="Force-cleaned {count} stuck pending entries after timeout",
+                                tag="BROWSER",
+                                params={"count": len(stuck_sigs)},
+                            )
+                        # Clean up the stuck contexts
+                        for sig in stuck_sigs:
+                            async with self._contexts_lock:
+                                context = self.contexts_by_config.pop(sig, None)
+                                self._context_refcounts.pop(sig, None)
+                                self._context_last_used.pop(sig, None)
+                            if context is not None:
+                                try:
+                                    await context.close()
+                                except Exception:
+                                    pass
+                        if len(self._pending_cleanup) < self._max_pending_browsers:
+                            self._cleanup_slot_available.set()
+
+        # Reached via break — clean up idle sigs immediately (outside locks)
+        for sig in idle_sigs:
+            async with self._contexts_lock:
+                context = self.contexts_by_config.pop(sig, None)
+                self._context_refcounts.pop(sig, None)
+                self._context_last_used.pop(sig, None)
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+        if idle_sigs and self.logger:
+            self.logger.debug(
+                message="Immediately cleaned up {count} idle contexts from version {version}",
+                tag="BROWSER",
+                params={"count": len(idle_sigs), "version": old_version},
+            )
+
+    async def _maybe_cleanup_old_browser(self, sig: str):
+        """Clean up an old browser's context if its refcount hit 0 and it's pending cleanup."""
+        async with self._pending_cleanup_lock:
+            if sig not in self._pending_cleanup:
+                return  # Not an old browser signature
+
+            cleanup_info = self._pending_cleanup.pop(sig)
+            old_version = cleanup_info["version"]
+
+            if self.logger:
+                self.logger.debug(
+                    message="Cleaning up context from browser version {version} (sig: {sig})",
+                    tag="BROWSER",
+                    params={"version": old_version, "sig": sig[:12]},
+                )
+
+            # Remove context from tracking
+            async with self._contexts_lock:
+                context = self.contexts_by_config.pop(sig, None)
+                self._context_refcounts.pop(sig, None)
+                self._context_last_used.pop(sig, None)
+
+            # Close context outside locks
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+
+            # Check if any signatures from this old version remain
+            remaining_old = [
+                s for s, info in self._pending_cleanup.items()
+                if info["version"] == old_version
+            ]
+
+            if not remaining_old:
+                if self.logger:
+                    self.logger.info(
+                        message="All contexts from browser version {version} cleaned up",
+                        tag="BROWSER",
+                        params={"version": old_version},
+                    )
+
+            # Open a cleanup slot if we're below the cap
+            if len(self._pending_cleanup) < self._max_pending_browsers:
+                self._cleanup_slot_available.set()
 
     def _cleanup_expired_sessions(self):
         """Clean up expired sessions based on TTL."""
@@ -7841,9 +11758,99 @@ class BrowserManager:
 
     async def close(self):
         """Close all browser resources and clean up."""
-        if self.config.cdp_url:
+        # Cached CDP path: only clean up this instance's sessions/contexts,
+        # then release the shared connection reference.
+        if self._using_cached_cdp:
+            session_ids = list(self.sessions.keys())
+            for session_id in session_ids:
+                await self.kill_session(session_id)
+            for ctx in self.contexts_by_config.values():
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+            self.contexts_by_config.clear()
+            self._context_refcounts.clear()
+            self._context_last_used.clear()
+            self._page_to_sig.clear()
+            await _CDPConnectionCache.release(self.config.cdp_url)
+            self.browser = None
+            self.playwright = None
+            self._using_cached_cdp = False
             return
-        
+
+        if self.config.cdp_url:
+            # When using external CDP, we don't own the browser process.
+            # If cdp_cleanup_on_close is True, properly disconnect from the browser
+            # and clean up Playwright resources. This frees the browser for other clients.
+            if self.config.cdp_cleanup_on_close:
+                # First close all sessions (pages)
+                session_ids = list(self.sessions.keys())
+                for session_id in session_ids:
+                    await self.kill_session(session_id)
+
+                # Close all contexts we created
+                for ctx in self.contexts_by_config.values():
+                    try:
+                        await ctx.close()
+                    except Exception:
+                        pass
+                self.contexts_by_config.clear()
+                self._context_refcounts.clear()
+                self._context_last_used.clear()
+                self._page_to_sig.clear()
+
+                # Disconnect from browser (doesn't terminate it, just releases connection)
+                if self.browser:
+                    try:
+                        await self.browser.close()
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.debug(
+                                message="Error disconnecting from CDP browser: {error}",
+                                tag="BROWSER",
+                                params={"error": str(e)}
+                            )
+                    self.browser = None
+                    # Allow time for CDP connection to fully release before another client connects
+                    if self.config.cdp_close_delay > 0:
+                        await asyncio.sleep(self.config.cdp_close_delay)
+
+                # Stop Playwright instance to prevent memory leaks
+                if self.playwright:
+                    await self.playwright.stop()
+                    self.playwright = None
+            return
+
+        # ── Persistent context launched via launch_persistent_context ──
+        if self._launched_persistent:
+            session_ids = list(self.sessions.keys())
+            for session_id in session_ids:
+                await self.kill_session(session_id)
+            for ctx in self.contexts_by_config.values():
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+            self.contexts_by_config.clear()
+            self._context_refcounts.clear()
+            self._context_last_used.clear()
+            self._page_to_sig.clear()
+
+            # Closing the persistent context also terminates the browser
+            if self.default_context:
+                try:
+                    await self.default_context.close()
+                except Exception:
+                    pass
+                self.default_context = None
+
+            if self.playwright:
+                await self.playwright.stop()
+                self.playwright = None
+            self._launched_persistent = False
+            return
+
         if self.config.sleep_on_close:
             await asyncio.sleep(0.5)
 
@@ -7862,6 +11869,9 @@ class BrowserManager:
                     params={"error": str(e)}
                 )
         self.contexts_by_config.clear()
+        self._context_refcounts.clear()
+        self._context_last_used.clear()
+        self._page_to_sig.clear()
 
         if self.browser:
             await self.browser.close()
@@ -7879,9 +11889,8 @@ class BrowserManager:
 ```
 
 
-
-
 ## File: docs/examples/quickstart.py
+
 
 ```py
 import os, sys
@@ -8452,6 +12461,7 @@ if __name__ == "__main__":
 
 ## File: docs/examples/quickstart_examples_set_1.py
 
+
 ```py
 import asyncio
 import os
@@ -8869,9 +12879,8 @@ if __name__ == "__main__":
 ```
 
 
-
-
 ## File: docs/examples/dispatcher_example.py
+
 
 ```py
 import asyncio
@@ -9016,51 +13025,31 @@ if __name__ == "__main__":
 
 ## File: docs/examples/hello_world.py
 
+
 ```py
 import asyncio
 from crawl4ai import (
     AsyncWebCrawler,
     BrowserConfig,
     CrawlerRunConfig,
-    CacheMode,
     DefaultMarkdownGenerator,
     PruningContentFilter,
     CrawlResult
 )
 
-async def example_cdp():
-    browser_conf = BrowserConfig(
-        headless=False,
-        cdp_url="http://localhost:9223"
-    )
-    crawler_config = CrawlerRunConfig(
-        session_id="test",
-        js_code = """(() => { return {"result": "Hello World!"} })()""",
-        js_only=True
-    )
-    async with AsyncWebCrawler(
-        config=browser_conf,
-        verbose=True,
-    ) as crawler:
-        result : CrawlResult = await crawler.arun(
-            url="https://www.helloworld.org",
-            config=crawler_config,
-        )
-        print(result.js_execution_result)
-                   
 
 async def main():
-    browser_config = BrowserConfig(headless=True, verbose=True)
+    browser_config = BrowserConfig(
+        headless=False,
+        verbose=True,
+    )
     async with AsyncWebCrawler(config=browser_config) as crawler:
         crawler_config = CrawlerRunConfig(
-            cache_mode=CacheMode.BYPASS,
             markdown_generator=DefaultMarkdownGenerator(
-                content_filter=PruningContentFilter(
-                     threshold=0.48, threshold_type="fixed", min_word_threshold=0
-                )
+                content_filter=PruningContentFilter()
             ),
         )
-        result : CrawlResult = await crawler.arun(
+        result: CrawlResult = await crawler.arun(
             url="https://www.helloworld.org", config=crawler_config
         )
         print(result.markdown.raw_markdown[:500])
@@ -9072,6 +13061,7 @@ if __name__ == "__main__":
 
 
 ## File: docs/examples/hooks_example.py
+
 
 ```py
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
@@ -9196,8 +13186,8 @@ if __name__ == "__main__":
 ```
 
 
-
 ## File: crawl4ai/deep_crawling/__init__.py
+
 
 ```py
 # deep_crawling/__init__.py
@@ -9252,6 +13242,7 @@ __all__ = [
 
 
 ## File: crawl4ai/deep_crawling/base_strategy.py
+
 
 ```py
 from __future__ import annotations
@@ -9419,12 +13410,13 @@ class DeepCrawlStrategy(ABC):
 
 ## File: crawl4ai/deep_crawling/bff_strategy.py
 
+
 ```py
 # best_first_crawling_strategy.py
 import asyncio
 import logging
 from datetime import datetime
-from typing import AsyncGenerator, Optional, Set, Dict, List, Tuple
+from typing import AsyncGenerator, Optional, Set, Dict, List, Tuple, Any, Callable, Awaitable, Union
 from urllib.parse import urlparse
 
 from ..models import TraversalStats
@@ -9433,6 +13425,7 @@ from .scorers import URLScorer
 from . import DeepCrawlStrategy
 
 from ..types import AsyncWebCrawler, CrawlerRunConfig, CrawlResult, RunManyReturn
+from ..utils import normalize_url_for_deep_crawl
 
 from math import inf as infinity
 
@@ -9460,18 +13453,38 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
         filter_chain: FilterChain = FilterChain(),
         url_scorer: Optional[URLScorer] = None,
         include_external: bool = False,
+        score_threshold: float = -infinity,
         max_pages: int = infinity,
         logger: Optional[logging.Logger] = None,
+        # Optional resume/callback parameters for crash recovery
+        resume_state: Optional[Dict[str, Any]] = None,
+        on_state_change: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+        # Optional cancellation callback - checked before each URL is processed
+        should_cancel: Optional[Callable[[], Union[bool, Awaitable[bool]]]] = None,
     ):
         self.max_depth = max_depth
         self.filter_chain = filter_chain
         self.url_scorer = url_scorer
         self.include_external = include_external
+        self.score_threshold = score_threshold
         self.max_pages = max_pages
-        self.logger = logger or logging.getLogger(__name__)
+        # self.logger = logger or logging.getLogger(__name__)
+        # Ensure logger is always a Logger instance, not a dict from serialization
+        if isinstance(logger, logging.Logger):
+            self.logger = logger
+        else:
+            # Create a new logger if logger is None, dict, or any other non-Logger type
+            self.logger = logging.getLogger(__name__)
         self.stats = TraversalStats(start_time=datetime.now())
         self._cancel_event = asyncio.Event()
         self._pages_crawled = 0
+        # Store for use in arun methods
+        self._resume_state = resume_state
+        self._on_state_change = on_state_change
+        self._should_cancel = should_cancel
+        self._last_state: Optional[Dict[str, Any]] = None
+        # Shadow list for queue items (only used when on_state_change is set)
+        self._queue_shadow: Optional[List[Tuple[float, int, str, Optional[str]]]] = None
 
     async def can_process_url(self, url: str, depth: int) -> bool:
         """
@@ -9494,6 +13507,55 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
             return False
 
         return True
+
+    def cancel(self) -> None:
+        """
+        Cancel the crawl. Thread-safe, can be called from any context.
+
+        The crawl will stop before processing the next URL. The current URL
+        being processed (if any) will complete before the crawl stops.
+        """
+        self._cancel_event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        """
+        Check if the crawl was/is cancelled. Thread-safe.
+
+        Returns:
+            True if the crawl has been cancelled, False otherwise.
+        """
+        return self._cancel_event.is_set()
+
+    async def _check_cancellation(self) -> bool:
+        """
+        Check if crawl should be cancelled.
+
+        Handles both internal cancel flag and external should_cancel callback.
+        Supports both sync and async callbacks.
+
+        Returns:
+            True if crawl should be cancelled, False otherwise.
+        """
+        if self._cancel_event.is_set():
+            return True
+
+        if self._should_cancel:
+            try:
+                # Handle both sync and async callbacks
+                result = self._should_cancel()
+                if asyncio.iscoroutine(result):
+                    result = await result
+
+                if result:
+                    self._cancel_event.set()
+                    self.stats.end_time = datetime.now()
+                    return True
+            except Exception as e:
+                # Fail-open: log warning and continue crawling
+                self.logger.warning(f"should_cancel callback error: {e}")
+
+        return False
 
     async def link_discovery(
         self,
@@ -9528,18 +13590,14 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
         valid_links = []
         for link in links:
             url = link.get("href")
-            if url in visited:
+            base_url = normalize_url_for_deep_crawl(url, source_url)
+            if base_url in visited:
                 continue
-            if not await self.can_process_url(url, new_depth):
+            if not await self.can_process_url(base_url, new_depth):
                 self.stats.urls_skipped += 1
                 continue
                 
-            valid_links.append(url)
-            
-        # If we have more valid links than capacity, limit them
-        if len(valid_links) > remaining_capacity:
-            valid_links = valid_links[:remaining_capacity]
-            self.logger.info(f"Limiting to {remaining_capacity} URLs due to max_pages limit")
+            valid_links.append(base_url)
             
         # Record the new depths and add to next_links
         for url in valid_links:
@@ -9554,19 +13612,56 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
     ) -> AsyncGenerator[CrawlResult, None]:
         """
         Core best-first crawl method using a priority queue.
-        
+
         The queue items are tuples of (score, depth, url, parent_url). Lower scores
         are treated as higher priority. URLs are processed in batches for efficiency.
         """
+        # Reset cancel event for strategy reuse
+        self._cancel_event = asyncio.Event()
+
         queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
-        # Push the initial URL with score 0 and depth 0.
-        await queue.put((0, 0, start_url, None))
-        visited: Set[str] = set()
-        depths: Dict[str, int] = {start_url: 0}
+
+        # Conditional state initialization for resume support
+        if self._resume_state:
+            visited = set(self._resume_state.get("visited", []))
+            depths = dict(self._resume_state.get("depths", {}))
+            self._pages_crawled = self._resume_state.get("pages_crawled", 0)
+            # Restore queue from saved items
+            queue_items = self._resume_state.get("queue_items", [])
+            for item in queue_items:
+                await queue.put((item["score"], item["depth"], item["url"], item["parent_url"]))
+            # Initialize shadow list if callback is set
+            if self._on_state_change:
+                self._queue_shadow = [
+                    (item["score"], item["depth"], item["url"], item["parent_url"])
+                    for item in queue_items
+                ]
+        else:
+            # Original initialization
+            initial_score = self.url_scorer.score(start_url) if self.url_scorer else 0
+            await queue.put((-initial_score, 0, start_url, None))
+            visited: Set[str] = set()
+            depths: Dict[str, int] = {start_url: 0}
+            # Initialize shadow list if callback is set
+            if self._on_state_change:
+                self._queue_shadow = [(-initial_score, 0, start_url, None)]
 
         while not queue.empty() and not self._cancel_event.is_set():
             # Stop if we've reached the max pages limit
             if self._pages_crawled >= self.max_pages:
+                self.logger.info(f"Max pages limit ({self.max_pages}) reached, stopping crawl")
+                break
+
+            # Check external cancellation callback before processing this batch
+            if await self._check_cancellation():
+                self.logger.info("Crawl cancelled by user")
+                break
+
+            # Calculate how many more URLs we can process in this batch
+            remaining = self.max_pages - self._pages_crawled
+            batch_size = min(BATCH_SIZE, remaining)
+            if batch_size <= 0:
+                # No more pages to crawl
                 self.logger.info(f"Max pages limit ({self.max_pages}) reached, stopping crawl")
                 break
                 
@@ -9576,6 +13671,12 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
                 if queue.empty():
                     break
                 item = await queue.get()
+                # Remove from shadow list if tracking
+                if self._on_state_change and self._queue_shadow is not None:
+                    try:
+                        self._queue_shadow.remove(item)
+                    except ValueError:
+                        pass  # Item may have been removed already
                 score, depth, url, parent_url = item
                 if url in visited:
                     continue
@@ -9599,11 +13700,15 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
                 result.metadata = result.metadata or {}
                 result.metadata["depth"] = depth
                 result.metadata["parent_url"] = parent_url
-                result.metadata["score"] = score
+                result.metadata["score"] = -score
                 
                 # Count only successful crawls toward max_pages limit
                 if result.success:
                     self._pages_crawled += 1
+                    # Check if we've reached the limit during batch processing
+                    if self._pages_crawled >= self.max_pages:
+                        self.logger.info(f"Max pages limit ({self.max_pages}) reached during batch, stopping crawl")
+                        break  # Exit the generator
                 
                 yield result
                 
@@ -9616,9 +13721,50 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
                     for new_url, new_parent in new_links:
                         new_depth = depths.get(new_url, depth + 1)
                         new_score = self.url_scorer.score(new_url) if self.url_scorer else 0
-                        await queue.put((new_score, new_depth, new_url, new_parent))
+                        # Skip URLs with scores below the threshold
+                        if new_score < self.score_threshold:
+                            self.logger.debug(
+                                f"URL {new_url} skipped: score {new_score} below threshold {self.score_threshold}"
+                            )
+                            self.stats.urls_skipped += 1
+                            continue
+                        queue_item = (-new_score, new_depth, new_url, new_parent)
+                        await queue.put(queue_item)
+                        # Add to shadow list if tracking
+                        if self._on_state_change and self._queue_shadow is not None:
+                            self._queue_shadow.append(queue_item)
 
-        # End of crawl.
+                    # Capture state after EACH URL processed (if callback set)
+                    if self._on_state_change and self._queue_shadow is not None:
+                        state = {
+                            "strategy_type": "best_first",
+                            "visited": list(visited),
+                            "queue_items": [
+                                {"score": s, "depth": d, "url": u, "parent_url": p}
+                                for s, d, u, p in self._queue_shadow
+                            ],
+                            "depths": depths,
+                            "pages_crawled": self._pages_crawled,
+                            "cancelled": self._cancel_event.is_set(),
+                        }
+                        self._last_state = state
+                        await self._on_state_change(state)
+
+        # Final state update if cancelled
+        if self._cancel_event.is_set() and self._on_state_change and self._queue_shadow is not None:
+            state = {
+                "strategy_type": "best_first",
+                "visited": list(visited),
+                "queue_items": [
+                    {"score": s, "depth": d, "url": u, "parent_url": p}
+                    for s, d, u, p in self._queue_shadow
+                ],
+                "depths": depths,
+                "pages_crawled": self._pages_crawled,
+                "cancelled": True,
+            }
+            self._last_state = state
+            await self._on_state_change(state)
 
     async def _arun_batch(
         self,
@@ -9676,17 +13822,30 @@ class BestFirstCrawlingStrategy(DeepCrawlStrategy):
         self._cancel_event.set()
         self.stats.end_time = datetime.now()
 
+    def export_state(self) -> Optional[Dict[str, Any]]:
+        """
+        Export current crawl state for external persistence.
+
+        Note: This returns the last captured state. For real-time state,
+        use the on_state_change callback.
+
+        Returns:
+            Dict with strategy state, or None if no state captured yet.
+        """
+        return self._last_state
+
 ```
 
 
 ## File: crawl4ai/deep_crawling/bfs_strategy.py
+
 
 ```py
 # bfs_deep_crawl_strategy.py
 import asyncio
 import logging
 from datetime import datetime
-from typing import AsyncGenerator, Optional, Set, Dict, List, Tuple
+from typing import AsyncGenerator, Optional, Set, Dict, List, Tuple, Any, Callable, Awaitable, Union
 from urllib.parse import urlparse
 
 from ..models import TraversalStats
@@ -9710,11 +13869,16 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
         self,
         max_depth: int,
         filter_chain: FilterChain = FilterChain(),
-        url_scorer: Optional[URLScorer] = None,        
+        url_scorer: Optional[URLScorer] = None,
         include_external: bool = False,
         score_threshold: float = -infinity,
         max_pages: int = infinity,
         logger: Optional[logging.Logger] = None,
+        # Optional resume/callback parameters for crash recovery
+        resume_state: Optional[Dict[str, Any]] = None,
+        on_state_change: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+        # Optional cancellation callback - checked before each URL is processed
+        should_cancel: Optional[Callable[[], Union[bool, Awaitable[bool]]]] = None,
     ):
         self.max_depth = max_depth
         self.filter_chain = filter_chain
@@ -9722,10 +13886,21 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
         self.include_external = include_external
         self.score_threshold = score_threshold
         self.max_pages = max_pages
-        self.logger = logger or logging.getLogger(__name__)
+        # self.logger = logger or logging.getLogger(__name__)
+        # Ensure logger is always a Logger instance, not a dict from serialization
+        if isinstance(logger, logging.Logger):
+            self.logger = logger
+        else:
+            # Create a new logger if logger is None, dict, or any other non-Logger type
+            self.logger = logging.getLogger(__name__)
         self.stats = TraversalStats(start_time=datetime.now())
         self._cancel_event = asyncio.Event()
         self._pages_crawled = 0
+        # Store for use in arun methods
+        self._resume_state = resume_state
+        self._on_state_change = on_state_change
+        self._should_cancel = should_cancel
+        self._last_state: Optional[Dict[str, Any]] = None
 
     async def can_process_url(self, url: str, depth: int) -> bool:
         """
@@ -9748,6 +13923,55 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
             return False
 
         return True
+
+    def cancel(self) -> None:
+        """
+        Cancel the crawl. Thread-safe, can be called from any context.
+
+        The crawl will stop before processing the next URL. The current URL
+        being processed (if any) will complete before the crawl stops.
+        """
+        self._cancel_event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        """
+        Check if the crawl was/is cancelled. Thread-safe.
+
+        Returns:
+            True if the crawl has been cancelled, False otherwise.
+        """
+        return self._cancel_event.is_set()
+
+    async def _check_cancellation(self) -> bool:
+        """
+        Check if crawl should be cancelled.
+
+        Handles both internal cancel flag and external should_cancel callback.
+        Supports both sync and async callbacks.
+
+        Returns:
+            True if crawl should be cancelled, False otherwise.
+        """
+        if self._cancel_event.is_set():
+            return True
+
+        if self._should_cancel:
+            try:
+                # Handle both sync and async callbacks
+                result = self._should_cancel()
+                if asyncio.iscoroutine(result):
+                    result = await result
+
+                if result:
+                    self._cancel_event.set()
+                    self.stats.end_time = datetime.now()
+                    return True
+            except Exception as e:
+                # Fail-open: log warning and continue crawling
+                self.logger.warning(f"should_cancel callback error: {e}")
+
+        return False
 
     async def link_discovery(
         self,
@@ -9789,7 +14013,7 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
             base_url = normalize_url_for_deep_crawl(url, source_url)
             if base_url in visited:
                 continue
-            if not await self.can_process_url(url, next_depth):
+            if not await self.can_process_url(base_url, next_depth):
                 self.stats.urls_skipped += 1
                 continue
 
@@ -9801,7 +14025,8 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                 self.logger.debug(f"URL {url} skipped: score {score} below threshold {self.score_threshold}")
                 self.stats.urls_skipped += 1
                 continue
-            
+
+            visited.add(base_url)
             valid_links.append((base_url, score))
         
         # If we have more valid links than capacity, sort by score and take the top ones
@@ -9832,26 +14057,45 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
         Batch (non-streaming) mode:
         Processes one BFS level at a time, then yields all the results.
         """
-        visited: Set[str] = set()
-        # current_level holds tuples: (url, parent_url)
-        current_level: List[Tuple[str, Optional[str]]] = [(start_url, None)]
-        depths: Dict[str, int] = {start_url: 0}
+        # Reset cancel event for strategy reuse
+        self._cancel_event = asyncio.Event()
+
+        # Conditional state initialization for resume support
+        if self._resume_state:
+            visited = set(self._resume_state.get("visited", []))
+            current_level = [
+                (item["url"], item["parent_url"])
+                for item in self._resume_state.get("pending", [])
+            ]
+            depths = dict(self._resume_state.get("depths", {}))
+            self._pages_crawled = self._resume_state.get("pages_crawled", 0)
+        else:
+            # Original initialization
+            visited: Set[str] = set()
+            # current_level holds tuples: (url, parent_url)
+            current_level: List[Tuple[str, Optional[str]]] = [(start_url, None)]
+            depths: Dict[str, int] = {start_url: 0}
 
         results: List[CrawlResult] = []
 
         while current_level and not self._cancel_event.is_set():
+            # Check if we've already reached max_pages before starting a new level
+            if self._pages_crawled >= self.max_pages:
+                self.logger.info(f"Max pages limit ({self.max_pages}) reached, stopping crawl")
+                break
+
+            # Check external cancellation callback before processing this level
+            if await self._check_cancellation():
+                self.logger.info("Crawl cancelled by user")
+                break
+
             next_level: List[Tuple[str, Optional[str]]] = []
             urls = [url for url, _ in current_level]
-            visited.update(urls)
 
             # Clone the config to disable deep crawling recursion and enforce batch mode.
             batch_config = config.clone(deep_crawl_strategy=None, stream=False)
             batch_results = await crawler.arun_many(urls=urls, config=batch_config)
-            
-            # Update pages crawled counter - count only successful crawls
-            successful_results = [r for r in batch_results if r.success]
-            self._pages_crawled += len(successful_results)
-            
+
             for result in batch_results:
                 url = result.url
                 depth = depths.get(url, 0)
@@ -9860,13 +14104,42 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                 parent_url = next((parent for (u, parent) in current_level if u == url), None)
                 result.metadata["parent_url"] = parent_url
                 results.append(result)
-                
+
                 # Only discover links from successful crawls
                 if result.success:
+                    # Increment pages crawled per URL for accurate state tracking
+                    self._pages_crawled += 1
+
                     # Link discovery will handle the max pages limit internally
                     await self.link_discovery(result, url, depth, visited, next_level, depths)
 
+                    # Capture state after EACH URL processed (if callback set)
+                    if self._on_state_change:
+                        state = {
+                            "strategy_type": "bfs",
+                            "visited": list(visited),
+                            "pending": [{"url": u, "parent_url": p} for u, p in next_level],
+                            "depths": depths,
+                            "pages_crawled": self._pages_crawled,
+                            "cancelled": self._cancel_event.is_set(),
+                        }
+                        self._last_state = state
+                        await self._on_state_change(state)
+
             current_level = next_level
+
+        # Final state update if cancelled
+        if self._cancel_event.is_set() and self._on_state_change:
+            state = {
+                "strategy_type": "bfs",
+                "visited": list(visited),
+                "pending": [{"url": u, "parent_url": p} for u, p in current_level],
+                "depths": depths,
+                "pages_crawled": self._pages_crawled,
+                "cancelled": True,
+            }
+            self._last_state = state
+            await self._on_state_change(state)
 
         return results
 
@@ -9880,11 +14153,30 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
         Streaming mode:
         Processes one BFS level at a time and yields results immediately as they arrive.
         """
-        visited: Set[str] = set()
-        current_level: List[Tuple[str, Optional[str]]] = [(start_url, None)]
-        depths: Dict[str, int] = {start_url: 0}
+        # Reset cancel event for strategy reuse
+        self._cancel_event = asyncio.Event()
+
+        # Conditional state initialization for resume support
+        if self._resume_state:
+            visited = set(self._resume_state.get("visited", []))
+            current_level = [
+                (item["url"], item["parent_url"])
+                for item in self._resume_state.get("pending", [])
+            ]
+            depths = dict(self._resume_state.get("depths", {}))
+            self._pages_crawled = self._resume_state.get("pages_crawled", 0)
+        else:
+            # Original initialization
+            visited: Set[str] = set()
+            current_level: List[Tuple[str, Optional[str]]] = [(start_url, None)]
+            depths: Dict[str, int] = {start_url: 0}
 
         while current_level and not self._cancel_event.is_set():
+            # Check external cancellation callback before processing this level
+            if await self._check_cancellation():
+                self.logger.info("Crawl cancelled by user")
+                break
+
             next_level: List[Tuple[str, Optional[str]]] = []
             urls = [url for url, _ in current_level]
             visited.update(urls)
@@ -9905,6 +14197,10 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                 # Count only successful crawls
                 if result.success:
                     self._pages_crawled += 1
+                    # Check if we've reached the limit during batch processing
+                    if self._pages_crawled >= self.max_pages:
+                        self.logger.info(f"Max pages limit ({self.max_pages}) reached during batch, stopping crawl")
+                        break  # Exit the generator
                 
                 results_count += 1
                 yield result
@@ -9913,13 +14209,39 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                 if result.success:
                     # Link discovery will handle the max pages limit internally
                     await self.link_discovery(result, url, depth, visited, next_level, depths)
-            
+
+                    # Capture state after EACH URL processed (if callback set)
+                    if self._on_state_change:
+                        state = {
+                            "strategy_type": "bfs",
+                            "visited": list(visited),
+                            "pending": [{"url": u, "parent_url": p} for u, p in next_level],
+                            "depths": depths,
+                            "pages_crawled": self._pages_crawled,
+                            "cancelled": self._cancel_event.is_set(),
+                        }
+                        self._last_state = state
+                        await self._on_state_change(state)
+
             # If we didn't get results back (e.g. due to errors), avoid getting stuck in an infinite loop
             # by considering these URLs as visited but not counting them toward the max_pages limit
             if results_count == 0 and urls:
                 self.logger.warning(f"No results returned for {len(urls)} URLs, marking as visited")
-                
+
             current_level = next_level
+
+        # Final state update if cancelled
+        if self._cancel_event.is_set() and self._on_state_change:
+            state = {
+                "strategy_type": "bfs",
+                "visited": list(visited),
+                "pending": [{"url": u, "parent_url": p} for u, p in current_level],
+                "depths": depths,
+                "pages_crawled": self._pages_crawled,
+                "cancelled": True,
+            }
+            self._last_state = state
+            await self._on_state_change(state)
 
     async def shutdown(self) -> None:
         """
@@ -9928,10 +14250,23 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
         self._cancel_event.set()
         self.stats.end_time = datetime.now()
 
+    def export_state(self) -> Optional[Dict[str, Any]]:
+        """
+        Export current crawl state for external persistence.
+
+        Note: This returns the last captured state. For real-time state,
+        use the on_state_change callback.
+
+        Returns:
+            Dict with strategy state, or None if no state captured yet.
+        """
+        return self._last_state
+
 ```
 
 
 ## File: crawl4ai/deep_crawling/filters.py
+
 
 ```py
 from abc import ABC, abstractmethod
@@ -10021,7 +14356,7 @@ class FilterChain:
 
     def add_filter(self, filter_: URLFilter) -> "FilterChain":
         """Add a filter to the chain"""
-        self.filters.append(filter_)
+        self.filters = self.filters + (filter_,)
         return self  # Enable method chaining
 
     async def apply(self, url: str) -> bool:
@@ -10056,6 +14391,9 @@ class URLPatternFilter(URLFilter):
     """Pattern filter balancing speed and completeness"""
 
     __slots__ = (
+        "patterns",  # Store original patterns for serialization
+        "use_glob",  # Store original use_glob for serialization  
+        "reverse",   # Store original reverse for serialization
         "_simple_suffixes",
         "_simple_prefixes",
         "_domain_patterns",
@@ -10078,6 +14416,11 @@ class URLPatternFilter(URLFilter):
         reverse: bool = False,
     ):
         super().__init__()
+        # Store original constructor params for serialization
+        self.patterns = patterns
+        self.use_glob = use_glob
+        self.reverse = reverse
+        
         self._reverse = reverse
         patterns = [patterns] if isinstance(patterns, (str, Pattern)) else patterns
 
@@ -10144,10 +14487,11 @@ class URLPatternFilter(URLFilter):
 
     @lru_cache(maxsize=10000)
     def apply(self, url: str) -> bool:
+        url_path = urlparse(url).path
+
         # Quick suffix check (*.html)
         if self._simple_suffixes:
-            path = url.split("?")[0]
-            if path.split("/")[-1].split(".")[-1] in self._simple_suffixes:
+            if url_path.split("/")[-1].split(".")[-1] in self._simple_suffixes:
                 result = True
                 self._update_stats(result)
                 return not result if self._reverse else result
@@ -10160,13 +14504,16 @@ class URLPatternFilter(URLFilter):
                     self._update_stats(result)
                     return not result if self._reverse else result
 
-        # Prefix check (/foo/*)
+        # Prefix check (/foo/* or https://domain/foo/*)
         if self._simple_prefixes:
-            path = url.split("?")[0]
-            if any(path.startswith(p) for p in self._simple_prefixes):
-                result = True
-                self._update_stats(result)
-                return not result if self._reverse else result
+            for prefix in self._simple_prefixes:
+                # Use url_path for path-only prefixes, full URL for absolute prefixes
+                match_against = url if '://' in prefix else url_path
+                if match_against.startswith(prefix):
+                    if len(match_against) == len(prefix) or match_against[len(prefix)] in ['/', '?', '#']:
+                        result = True
+                        self._update_stats(result)
+                        return not result if self._reverse else result
 
         # Complex patterns
         if self._path_patterns:
@@ -10273,6 +14620,15 @@ class ContentTypeFilter(URLFilter):
         "sqlite": "application/vnd.sqlite3",
         # Placeholder
         "unknown": "application/octet-stream",  # Fallback for unknown file types
+        # php
+        "php": "application/x-httpd-php",
+        "php3": "application/x-httpd-php",
+        "php4": "application/x-httpd-php",
+        "php5": "application/x-httpd-php",
+        "php7": "application/x-httpd-php",
+        "phtml": "application/x-httpd-php",
+        "phps": "application/x-httpd-php-source",
+
     }
 
     @staticmethod
@@ -10417,18 +14773,22 @@ class DomainFilter(URLFilter):
 class ContentRelevanceFilter(URLFilter):
     """BM25-based relevance filter using head section content"""
 
-    __slots__ = ("query_terms", "threshold", "k1", "b", "avgdl")
+    __slots__ = ("query_terms", "threshold", "k1", "b", "avgdl", "query")
 
     def __init__(
         self,
-        query: str,
+        query: Union[str, List[str]],
         threshold: float,
         k1: float = 1.2,
         b: float = 0.75,
         avgdl: int = 1000,
     ):
         super().__init__(name="BM25RelevanceFilter")
-        self.query_terms = self._tokenize(query)
+        if isinstance(query, list):
+            self.query = " ".join(query)
+        else:
+            self.query = query
+        self.query_terms = self._tokenize(self.query)
         self.threshold = threshold
         self.k1 = k1  # TF saturation parameter
         self.b = b  # Length normalization parameter
@@ -10605,6 +14965,7 @@ class SEOFilter(URLFilter):
 
 
 ## File: crawl4ai/deep_crawling/scorers.py
+
 
 ```py
 from abc import ABC, abstractmethod
@@ -11131,6 +15492,7 @@ class DomainAuthorityScorer(URLScorer):
 
 ## File: docs/examples/deepcrawl_example.py
 
+
 ```py
 import asyncio
 import time
@@ -11599,6 +15961,7 @@ async def wrap_up():
     print("\n📊 Pages crawled by depth:")
     for depth, count in sorted(depth_counts.items()):
         print(f"  Depth {depth}: {count} pages")
+
 
 async def run_tutorial():
     """

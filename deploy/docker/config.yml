@@ -68,32 +68,35 @@ crawler:
     max_pages: 40                          # ← GLOBAL_SEM permits
     idle_ttl_sec: 300                     # ← 30 min janitor cutoff
   browser:
+    use_undetected: true                   # 启用 Patchright 反检测引擎（绕 Cloudflare）
     kwargs:
       headless: true
       text_mode: false
-      enable_stealth: true
-      user_agent_mode: "random"
+      enable_stealth: false              # Patchright 已在二进制层处理，playwright-stealth 反而冲突
+      # user_agent_mode: "random"        # 禁用：随机 UA 导致 Sec-Ch-Ua/UA 不一致（如 Edge UA + Chrome hint）
     extra_args:
-      # - "--single-process"
       - "--no-sandbox"
       - "--disable-dev-shm-usage"
       - "--disable-gpu"
-      - "--disable-software-rasterizer"
-      # --disable-web-security removed for security (enables cross-origin access)
-      - "--allow-insecure-localhost"
-      - "--ignore-certificate-errors"
+      # 去掉以下特征旗，Cloudflare 会检测它们
+      # - "--disable-web-security"
+      # - "--allow-insecure-localhost"
+      # - "--ignore-certificate-errors"
+      # - "--disable-software-rasterizer"
+      - "--window-size=1920,1080"
   run_config:
     stream: false
-    simulate_user: true
+    simulate_user: false
     word_count_threshold: 10
     only_text: false
-    wait_until: "load"
+    wait_until: "domcontentloaded"
     page_timeout: 60000
     process_iframes: false
     magic: true
     remove_overlay_elements: true
+    remove_consent_popups: true
     delay_before_return_html: 1.0
-    override_navigator: true
+    override_navigator: false
 
 # Logging Configuration
 logging:
