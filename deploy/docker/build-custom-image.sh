@@ -36,6 +36,7 @@ fi
 
 # No build context needed — pipe Dockerfile via stdin
 docker build \
+    --no-cache \
     --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
     --build-arg "GITHUB_REPO=${GITHUB_REPO}" \
     --build-arg "GITHUB_BRANCH=${GITHUB_BRANCH}" \

@@ -787,17 +787,23 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         redirected_url = page.url
                         redirected_status_code = response.status if response else None
                     except Error as e:
-                        # Allow navigation to be aborted when downloading files
-                        # This is expected behavior for downloads in some browser engines
-                        if 'net::ERR_ABORTED' in str(e) and self.browser_config.accept_downloads:
+                        err_str = str(e)
+                        if 'net::ERR_ABORTED' in err_str and self.browser_config.accept_downloads:
                             self.logger.info(
                                 message=f"Navigation aborted, likely due to file download: {url}",
                                 tag="GOTO",
                                 params={"url": url},
                             )
                             response = None
+                        elif 'net::ERR_HTTP_RESPONSE_CODE_FAILURE' in err_str:
+                            self.logger.info(
+                                message="HTTP error status received: {url}",
+                                tag="GOTO",
+                                params={"url": url},
+                            )
+                            response = None
                         else:
-                            raise RuntimeError(f"Failed on navigating ACS-GOTO:\n{str(e)}")
+                            raise RuntimeError(f"Failed on navigating ACS-GOTO:\n{err_str}")
 
                     # ──────────────────────────────────────────────────────────────
                     # Walk the redirect chain.  Playwright returns only the last
@@ -806,7 +812,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     # status-code.
                     # ──────────────────────────────────────────────────────────────
                     if response is None:
-                        status_code = 200
+                        status_code = _js_nav_status if _js_nav_status is not None else 200
                         response_headers = {}
                     else:
                         first_resp = response
@@ -1557,23 +1563,16 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         Args:
             page (Page): The Playwright page instance
         """
+        # JS script includes guards against removing <body>/<html> and overly aggressive
+        # matching. See remove_overlay_elements.js for detailed issue notes.
         remove_overlays_js = load_js_script("remove_overlay_elements")
 
         try:
             await self.adapter.evaluate(page,
                 f"""
                 (async () => {{
-                    try {{
-                        const removeOverlays = {remove_overlays_js};
-                        await removeOverlays();
-                        return {{ success: true }};
-                    }} catch (error) {{
-                        return {{
-                            success: false,
-                            error: error.toString(),
-                            stack: error.stack
-                        }};
-                    }}
+                    const fn = {remove_overlays_js};
+                    await fn();
                 }})()
             """
             )
