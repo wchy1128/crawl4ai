@@ -110,7 +110,7 @@ crawler:
       - "--window-size=1920,1080"
   run_config:
     stream: false
-    simulate_user: false
+    simulate_user: true
     word_count_threshold: 10
     only_text: false
     wait_until: "domcontentloaded"
@@ -120,7 +120,18 @@ crawler:
     remove_overlay_elements: true
     remove_consent_popups: true
     delay_before_return_html: 1.0
-    override_navigator: false
+    override_navigator: false           # use_undetected开启时，不需要打开
+
+    scan_full_page: true
+    scroll_delay: 0.3                   # 稍长的滚动间隔，更像人类
+    max_scroll_steps: 20
+
+    max_retries: 2
+    proxy_config:
+      - "direct"
+      # - server: "http://proxy1.example.com:8080"
+      #   username: "user"
+      #   password: "pass"
 
 # Logging Configuration
 logging:
