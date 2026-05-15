@@ -201,6 +201,7 @@ async () => {
     // Text-content fallback: find buttons by visible text
     if (!accepted) {
         const acceptPatterns = [
+            // English
             /^accept\s*(all)?(\s*cookies)?$/i,
             /^allow\s*(all)?(\s*cookies)?$/i,
             /^i\s*agree$/i,
@@ -208,6 +209,40 @@ async () => {
             /^got\s*it[!]?$/i,
             /^consent$/i,
             /^(accept|agree)\s*&?\s*close$/i,
+            // Chinese (Simplified / Traditional)
+            /^全部接受$/, /^全部同意$/, /^同意全部$/, /^接受全部$/,
+            /^接受$/, /^同意$/, /^我同意$/, /^确认$/, /^好的$/,
+            /^全部允[许許]$/,
+            // Japanese
+            /^すべて同意$/, /^同意する$/, /^承諾$/, /^受け入れる$/, /^OK$/,
+            // Korean
+            /^모두 동의$/, /^동의$/, /^수락$/, /^허용$/,
+            // German
+            /^alle akzeptieren$/i, /^akzeptieren$/i, /^zustimmen$/i, /^einverstanden$/i,
+            // French
+            /^tout accepter$/i, /^accepter$/i, /^j'accepte$/i, /^je suis d'accord$/i,
+            // Spanish
+            /^aceptar todo$/i, /^aceptar$/i, /^estoy de acuerdo$/i,
+            // Portuguese
+            /^aceitar tudo$/i, /^aceitar$/i, /^concordo$/i,
+            // Italian
+            /^accetta tutto$/i, /^accetta$/i, /^sono d'accordo$/i,
+            // Russian
+            /^принять всё$/i, /^принять$/i, /^согласен$/i,
+            // Dutch
+            /^alles accepteren$/i, /^accepteren$/i, /^ik ga akkoord$/i,
+            // Polish
+            /^akceptuj wszystkie$/i, /^akceptuj$/i, /^zgadzam się$/i,
+            // Turkish
+            /^tümünü kabul et$/i, /^kabul et$/i, /^kabul$/i,
+            // Arabic
+            /^قبول الكل$/, /^قبول$/, /^أوافق$/,
+            // Hindi
+            /^सभी स्वीकार करें$/, /^स्वीकार करें$/, /^सहमत$/,
+            // Thai
+            /^ยอมรับทั้งหมด$/, /^ยอมรับ$/, /^เห็นด้วย$/,
+            // Vietnamese
+            /^chấp nhận tất cả$/i, /^chấp nhận$/i, /^đồng ý$/i,
         ];
 
         const candidates = document.querySelectorAll(
