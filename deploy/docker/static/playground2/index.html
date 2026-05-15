@@ -292,6 +292,16 @@
                     </div>
                 </details>
 
+                <div class="flex items-center gap-3 mb-2">
+                    <label class="text-xs text-secondary" title="Sandbox security level for HTML preview iframe">Preview sandbox:</label>
+                    <select id="sandbox-level" class="bg-dark border border-border rounded px-1.5 py-0.5 text-xs text-light cursor-pointer">
+                        <option value="">Strict (no external resources)</option>
+                        <option value="allow-same-origin" selected>Standard (load CSS/images)</option>
+                        <option value="allow-same-origin allow-scripts">Relaxed (allow JS)</option>
+                        <option value="none">None (no sandbox)</option>
+                    </select>
+                </div>
+
                 <div class="flex space-x-2">
                     <button id="run-btn" class="bg-primary text-dark px-4 py-2 rounded hover:bg-primarydim font-medium">
                         Run (⌘/Ctrl+Enter)
@@ -1090,10 +1100,34 @@
             // --- Preview ---
             const iframe = document.getElementById('html-preview-iframe');
             const emptyPreview = document.getElementById('html-preview-empty');
+
+            // Apply sandbox level from setting
+            const sandboxSelect = document.getElementById('sandbox-level');
+            const sandboxValue = sandboxSelect ? sandboxSelect.value : 'allow-same-origin';
+            if (sandboxValue === 'none') {
+                iframe.removeAttribute('sandbox');
+            } else {
+                iframe.setAttribute('sandbox', sandboxValue);
+            }
+
             if (htmlContent) {
                 iframe.classList.remove('hidden');
                 emptyPreview.classList.add('hidden');
-                iframe.srcdoc = htmlContent;
+
+                // Inject <base> tag so relative URLs resolve to original site
+                const baseUrl = redirectedUrl || requestedUrl;
+                let previewHtml = htmlContent;
+                if (baseUrl && sandboxValue !== '') {
+                    const baseTag = `<base href="${baseUrl}">`;
+                    if (previewHtml.match(/<head[^>]*>/i)) {
+                        previewHtml = previewHtml.replace(/<head[^>]*>/i, '$&' + baseTag);
+                    } else if (previewHtml.match(/<html[^>]*>/i)) {
+                        previewHtml = previewHtml.replace(/<html[^>]*>/i, '$&<head>' + baseTag + '</head>');
+                    } else {
+                        previewHtml = baseTag + previewHtml;
+                    }
+                }
+                iframe.srcdoc = previewHtml;
             } else {
                 iframe.classList.add('hidden');
                 emptyPreview.classList.remove('hidden');
