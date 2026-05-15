@@ -82,8 +82,30 @@ async () => {
         const hasSemiTransBg = bgAlpha > 0 && bgAlpha < 1;
         const hasLowOpacity = parseFloat(style.opacity) < 1;
 
-        if (isLarge || hasSemiTransBg || hasLowOpacity) {
-            elem.remove();
+        // ISSUE: position:fixed/absolute is widely used for layout (headers, backgrounds,
+        // search boxes) not just overlays. Both Baidu and Bing homepages use position:fixed
+        // with low z-index for core UI. isLarge alone causes false positives.
+        // Fix: only trust isLarge for high z-index (> 999) elements. For low z-index
+        // elements, require overlay evidence (semi-transparent background or low opacity).
+        // ISSUE: fixed top navigation bars often span the full viewport width with high z-index
+        // (e.g. documentation site headers). Removing them can make a following content
+        // container become the first matching layout element and get styled/removed as nav too.
+        // Fix: skip likely top navigation/header containers before applying overlay removal.
+        const rect = elem.getBoundingClientRect();
+        const isLikelyTopNavigation = rect.top <= 5 && (
+            elem.matches('nav, header, [role="navigation"], [role="banner"]') ||
+            elem.querySelector('nav, header, [role="navigation"], [role="banner"]')
+        );
+        if (isLikelyTopNavigation) continue;
+
+        if (zIndex > 999) {
+            if (isLarge || hasSemiTransBg || hasLowOpacity) {
+                elem.remove();
+            }
+        } else {
+            if (hasSemiTransBg || hasLowOpacity) {
+                elem.remove();
+            }
         }
     }
 
@@ -123,6 +145,14 @@ async () => {
         // Must be near top or bottom edge of viewport
         const nearTop = rect.top <= 5;
         const nearBottom = rect.bottom >= vh - 5;
+        // ISSUE: same top navigation/header false positive as the high z-index heuristic above.
+        // Keep real site navigation while still allowing bottom cookie/ad bars to be removed.
+        if (nearTop && (
+            elem.matches('nav, header, [role="navigation"], [role="banner"]') ||
+            elem.querySelector('nav, header, [role="navigation"], [role="banner"]')
+        )) {
+            return;
+        }
         if (nearTop || nearBottom) {
             elem.remove();
         }

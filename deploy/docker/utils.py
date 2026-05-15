@@ -114,6 +114,19 @@ def get_browser_config_dict(config: dict) -> dict:
     return result
 
 
+def _load_user_js() -> str:
+    """Load user_js.js if it exists (user's default JS injection code)."""
+    path = Path(__file__).parent / "user_js.js"
+    if path.exists():
+        code = path.read_text(encoding="utf-8").strip()
+        if code:
+            return code
+    return None
+
+
+_USER_JS = _load_user_js()
+
+
 def get_run_config_dict(config: dict) -> dict:
     """Extract run config dict from the loaded config (supports both run_config and legacy base_config)."""
     crawler = config.get("crawler", {})
@@ -122,6 +135,9 @@ def get_run_config_dict(config: dict) -> dict:
     crawler_verbose = crawler.get("verbose")
     if crawler_verbose is not None:
         result["verbose"] = crawler_verbose
+    # Inject the default user JS file as js_code unless the config already provides one.
+    if _USER_JS and "js_code" not in result:
+        result["js_code"] = _USER_JS
     return result
 
 
