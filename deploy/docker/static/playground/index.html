@@ -320,7 +320,7 @@
             </div>
             <div class="flex-1 overflow-auto relative">
                 <!-- Response Tab -->
-                <div class="tab-content active h-full">
+                <div class="tab-content active h-full" data-tab="response">
                     <div class="absolute right-2 top-2">
                         <button class="copy-btn bg-surface border border-border rounded px-2 py-1 text-xs hover:bg-dark"
                             data-target="#response-content code">
@@ -331,7 +331,7 @@
                 </div>
 
                 <!-- Python Tab -->
-                <div class="tab-content hidden h-full">
+                <div class="tab-content hidden h-full" data-tab="python">
                     <div class="absolute right-2 top-2">
                         <button class="copy-btn bg-surface border border-border rounded px-2 py-1 text-xs hover:bg-dark"
                             data-target="#python-content code">
@@ -342,7 +342,7 @@
                 </div>
 
                 <!-- cURL Tab -->
-                <div class="tab-content hidden h-full">
+                <div class="tab-content hidden h-full" data-tab="curl">
                     <div class="absolute right-2 top-2">
                         <button class="copy-btn bg-surface border border-border rounded px-2 py-1 text-xs hover:bg-dark"
                             data-target="#curl-content code">
@@ -417,7 +417,7 @@
 
                 btn.classList.add('active');
                 const tabName = btn.dataset.tab;
-                document.querySelector(`#${tabName}-content`).parentElement.classList.remove('hidden');
+                document.querySelector(`.tab-content[data-tab="${tabName}"]`).classList.remove('hidden');
 
                 // Re-highlight content when switching tabs
                 const activeCode = document.querySelector(`#${tabName}-content code`);
@@ -635,14 +635,14 @@
             } catch (err) {
                 const ccText = cmCC.getValue();
                 const streamFlag = /stream\s*=\s*True/i.test(ccText);
-                const isCrawlEndpoint = document.getElementById('endpoint').value === 'crawl';
+                const isCrawlEndpoint = endpoint === 'crawl';
                 if (isCrawlEndpoint && streamFlag) {
                     advConfig = { browser_config: {}, crawler_config: { stream: true } };
                 } else {
                     updateStatus('error');
-                    document.querySelector('#response-content code').textContent =
-                        JSON.stringify({ error: err.message }, null, 2);
-                    forceHighlightElement(document.querySelector('#response-content code'));
+                    const respCodeEl = document.querySelector('#response-content code');
+                    respCodeEl.textContent = JSON.stringify({ error: err.message }, null, 2);
+                    forceHighlightElement(respCodeEl);
                     return; // stop run
                 }
             }
@@ -708,9 +708,10 @@
                         throw new Error(responseData.detail || responseData.error || 'Request failed');
                     }
                     updateStatus('success', time);
-                    document.querySelector('#response-content code').textContent = JSON.stringify(responseData, null, 2);
-                    document.querySelector('#response-content code').className = 'json hljs';
-                    forceHighlightElement(document.querySelector('#response-content code'));
+                    const respCodeEl = document.querySelector('#response-content code');
+                    respCodeEl.textContent = JSON.stringify(responseData, null, 2);
+                    respCodeEl.className = 'json hljs';
+                    forceHighlightElement(respCodeEl);
                 } else if (endpoint === 'crawl_stream' || useStreamOverride) {
                     // Stream processing - now handled directly by /crawl endpoint
                     response = await fetch(api, {
@@ -744,12 +745,12 @@
                         });
                     }
 
-                    responseData = { stream: text };
                     const time = Math.round(performance.now() - startTime);
                     updateStatus('success', time, null, maxMemory);
-                    document.querySelector('#response-content code').textContent = text;
-                    document.querySelector('#response-content code').className = 'json hljs'; // Reset classes
-                    forceHighlightElement(document.querySelector('#response-content code'));
+                    const respCodeEl = document.querySelector('#response-content code');
+                    respCodeEl.textContent = text;
+                    respCodeEl.className = 'json hljs';
+                    forceHighlightElement(respCodeEl);
                 } else {
                     // Regular request (handles /crawl and /md)
                     response = await fetch(api, {
@@ -773,13 +774,12 @@
                         responseData.server_peak_memory_mb
                     );
 
-                    document.querySelector('#response-content code').textContent = JSON.stringify(responseData, null, 2);
-                    document.querySelector('#response-content code').className = 'json hljs'; // Ensure class is set
-                    forceHighlightElement(document.querySelector('#response-content code'));
+                    const respCodeEl = document.querySelector('#response-content code');
+                    respCodeEl.textContent = JSON.stringify(responseData, null, 2);
+                    respCodeEl.className = 'json hljs';
+                    forceHighlightElement(respCodeEl);
                 }
 
-                forceHighlightElement(document.querySelector('#response-content code'));
-                
                 // For generateSnippets, handle the LLM case specially
                 if (endpoint === 'llm') {
                     const url = urls[0];
@@ -793,12 +793,9 @@
             } catch (error) {
                 console.error('Error:', error);
                 updateStatus('error');
-                document.querySelector('#response-content code').textContent = JSON.stringify(
-                    { error: error.message },
-                    null,
-                    2
-                );
-                forceHighlightElement(document.querySelector('#response-content code'));
+                const respCodeEl = document.querySelector('#response-content code');
+                respCodeEl.textContent = JSON.stringify({ error: error.message }, null, 2);
+                forceHighlightElement(respCodeEl);
             }
         }
 
@@ -945,7 +942,7 @@
         // Initialize clipboard for all copy buttons
         function initCopyButtons() {
             document.querySelectorAll('.copy-btn').forEach(btn => {
-                new  ClipboardJS(btn, {
+                new ClipboardJS(btn, {
                     text: () => {
                         const target = document.querySelector(btn.dataset.target);
                         return target ? target.textContent : '';

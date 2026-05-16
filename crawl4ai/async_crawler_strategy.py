@@ -601,20 +601,26 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             # at context level by setup_context(). This fallback covers
             # managed-browser / persistent / CDP paths where setup_context()
             # is called without a crawlerRunConfig.
+            # Patchright: ALL add_init_script() variants break DNS; skip here
+            # since Patchright's binary patches already handle navigator.
             if config.override_navigator or config.simulate_user or config.magic:
                 if not getattr(context, '_crawl4ai_nav_overrider_injected', False):
-                    await context.add_init_script(load_js_script("navigator_overrider"))
+                    if not isinstance(self.adapter, UndetectedAdapter):
+                        await context.add_init_script(load_js_script("navigator_overrider"))
                     context._crawl4ai_nav_overrider_injected = True
 
-            # Force-open closed shadow roots — same guard against duplication
+            # Force-open closed shadow roots — same guard against duplication.
+            # Patchright: init_script is skipped; attachShadow is patched after
+            # goto completes via page.evaluate() below (best-effort).
             if config.flatten_shadow_dom:
                 if not getattr(context, '_crawl4ai_shadow_dom_injected', False):
-                    await context.add_init_script("""
-                        const _origAttachShadow = Element.prototype.attachShadow;
-                        Element.prototype.attachShadow = function(init) {
-                            return _origAttachShadow.call(this, {...init, mode: 'open'});
-                        };
-                    """)
+                    if not isinstance(self.adapter, UndetectedAdapter):
+                        await context.add_init_script("""
+                            const _origAttachShadow = Element.prototype.attachShadow;
+                            Element.prototype.attachShadow = function(init) {
+                                return _origAttachShadow.call(this, {...init, mode: 'open'});
+                            };
+                        """)
                     context._crawl4ai_shadow_dom_injected = True
 
             # Call hook after page creation
@@ -919,6 +925,20 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
 
             #     if not config.ignore_body_visibility:
             #         raise Error(f"Body element is hidden: {visibility_info}")
+
+            # Patchright: attachShadow override cannot run via add_init_script()
+            # (breaks DNS).  Apply it post-load via page.evaluate() instead —
+            # this is best-effort: shadow roots created before this point remain
+            # closed.  Without Patchright the init_script handles this before any
+            # page script runs.
+            if config.flatten_shadow_dom and isinstance(self.adapter, UndetectedAdapter):
+                try:
+                    await self.adapter.evaluate(page, """const _origAttachShadow = Element.prototype.attachShadow;
+Element.prototype.attachShadow = function(init) {
+    return _origAttachShadow.call(this, {...init, mode: 'open'});
+};""")
+                except Exception:
+                    pass
 
             # Handle content loading and viewport adjustment
             if not self.browser_config.text_mode and (
