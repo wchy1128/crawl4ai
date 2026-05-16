@@ -97,6 +97,8 @@ crawler:
     remove_consent_popups: true
     delay_before_return_html: 1.0
     override_navigator: false           # use_undetected开启时，不需要打开
+    
+    flatten_shadow_dom: true            # 大网页可能增加耗时，html内容膨胀
 
     scan_full_page: true
     scroll_delay: 0.3                   # 稍长的滚动间隔，更像人类
