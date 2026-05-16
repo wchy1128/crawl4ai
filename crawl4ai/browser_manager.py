@@ -713,7 +713,17 @@ class BrowserManager:
         Args:
             browser_config (BrowserConfig): Configuration object containing all browser settings
             logger: Logger instance for recording events and errors
-            use_undetected (bool): Whether to use undetected browser (Patchright)
+            use_undetected (bool): Whether to use undetected browser (Patchright).
+
+                When True, the manager uses Patchright (playwright fork with
+                binary-level anti-detection patches) and MUST skip all
+                add_init_script() calls — Patchright's driver layer has a DNS
+                bug where Page.addScriptToEvaluateOnNewDocument breaks name
+                resolution on subsequent navigations.
+
+                enable_stealth is mutually exclusive with use_undetected:
+                playwright_stealth injects via add_init_script(), which is
+                incompatible with Patchright for the same reason.
         """
         self.config: BrowserConfig = browser_config
         self.logger = logger
@@ -758,7 +768,12 @@ class BrowserManager:
         self._cleanup_slot_available = asyncio.Event()
         self._cleanup_slot_available.set()  # starts open
 
-        # Stealth adapter for stealth mode
+        # Stealth adapter for enable_stealth mode.
+        # Only created when NOT using Patchright, because playwright_stealth
+        # injects via add_init_script(), which triggers Patchright's DNS bug.
+        # Previously StealthAdapter was silently broken — it tried to import
+        # non-existent stealth_async / stealth_sync names.  Fixed to use the
+        # correct Stealth class from playwright_stealth.
         self._stealth_adapter = None
         if self.config.enable_stealth and not self.use_undetected:
             from .browser_adapter import StealthAdapter
@@ -1138,6 +1153,27 @@ class BrowserManager:
 
         return browser_args
 
+    def _warn_init_script_skipped(self, source: str) -> None:
+        """Log that init_scripts cannot run under Patchright (use_undetected).
+
+        Patchright's driver layer has a bug where any CDP
+        Page.addScriptToEvaluateOnNewDocument call (used by all add_init_script()
+        variants, context-level AND page-level) breaks DNS resolution, causing
+        ERR_NAME_NOT_RESOLVED / NS_ERROR_UNKNOWN_HOST on subsequent navigations.
+        Both Chromium and Firefox engine are affected.
+
+        This is NOT a Chromium binary-patch issue — pure Playwright works fine.
+        """
+        if self.logger:
+            self.logger.warning(
+                message="Skipping init_script ({source}) — incompatible with Patchright "
+                        "(use_undetected). Patchright already handles navigator evasions "
+                        "at the binary level. For shadow DOM, attachShadow is patched "
+                        "post-load via page.evaluate() instead.",
+                tag="BROWSER",
+                params={"source": source},
+            )
+
     async def setup_context(
         self,
         context: BrowserContext,
@@ -1221,8 +1257,13 @@ class BrowserManager:
                 ]
             )
 
-        # Handle navigator overrides
-        if crawlerRunConfig:
+        # Handle navigator overrides.
+        # NOTE: Patchright (use_undetected=True) must NOT call any
+        # add_init_script() — both context and page level variants
+        # trigger ERR_NAME_NOT_RESOLVED. Patchright's binary-level
+        # patches already handle navigator evasions, so skipping here
+        # is safe.
+        if crawlerRunConfig and not self.use_undetected:
             if (
                 crawlerRunConfig.override_navigator
                 or crawlerRunConfig.simulate_user
@@ -1231,8 +1272,10 @@ class BrowserManager:
                 await context.add_init_script(load_js_script("navigator_overrider"))
                 context._crawl4ai_nav_overrider_injected = True
 
-        # Force-open closed shadow roots when flatten_shadow_dom is enabled
-        if crawlerRunConfig and crawlerRunConfig.flatten_shadow_dom:
+        # Force-open closed shadow roots when flatten_shadow_dom is enabled.
+        # Patchright: init_script is skipped; attachShadow is patched later via
+        # page.evaluate() in _crawl_web() after goto completes (best-effort).
+        if crawlerRunConfig and crawlerRunConfig.flatten_shadow_dom and not self.use_undetected:
             await context.add_init_script("""
                 const _origAttachShadow = Element.prototype.attachShadow;
                 Element.prototype.attachShadow = function(init) {
@@ -1244,7 +1287,10 @@ class BrowserManager:
         # Apply custom init_scripts from BrowserConfig (for stealth evasions, etc.)
         if self.config.init_scripts:
             for script in self.config.init_scripts:
-                await context.add_init_script(script)
+                if self.use_undetected:
+                    self._warn_init_script_skipped("BrowserConfig.init_scripts")
+                else:
+                    await context.add_init_script(script)
 
     async def create_browser_context(self, crawlerRunConfig: CrawlerRunConfig = None):
         """
