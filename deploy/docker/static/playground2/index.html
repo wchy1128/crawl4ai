@@ -293,6 +293,12 @@
                 </details>
 
                 <div class="flex items-center gap-3 mb-2">
+                    <label class="text-xs text-secondary" title="Source used for HTML preview iframe">Preview source:</label>
+                    <select id="preview-source" class="bg-dark border border-border rounded px-1.5 py-0.5 text-xs text-light cursor-pointer">
+                        <option value="raw" selected>Raw HTML</option>
+                        <option value="cleaned">Cleaned HTML</option>
+                    </select>
+                    <span id="cleaned-fallback-badge" class="hidden text-xs text-yellow-400" title="cleaned_html not available, falling back to raw HTML">⚠ fallback to raw</span>
                     <label class="text-xs text-secondary" title="Sandbox security level for HTML preview iframe">Preview sandbox:</label>
                     <select id="sandbox-level" class="bg-dark border border-border rounded px-1.5 py-0.5 text-xs text-light cursor-pointer">
                         <option value="">Strict (no external resources)</option>
@@ -342,7 +348,7 @@
             </div>
             <div class="flex-1 overflow-auto relative">
                 <!-- Response Tab -->
-                <div class="tab-content active h-full">
+                <div class="tab-content active h-full" data-tab="response">
                     <div class="absolute right-2 top-2">
                         <button class="copy-btn bg-surface border border-border rounded px-2 py-1 text-xs hover:bg-dark"
                             data-target="#response-content code">
@@ -353,8 +359,7 @@
                 </div>
 
                 <!-- HTML Preview Tab -->
-                <div class="tab-content hidden h-full">
-                    <span id="html-content" class="hidden"></span>
+                <div class="tab-content hidden h-full" data-tab="html">
                     <!-- URL Selector (multi-URL results) -->
                     <div id="html-url-selector" class="hidden border-b border-border px-4 py-2 flex items-center gap-2">
                         <label class="text-xs text-secondary">Result:</label>
@@ -441,7 +446,7 @@
                 </div>
 
                 <!-- Python Tab -->
-                <div class="tab-content hidden h-full">
+                <div class="tab-content hidden h-full" data-tab="python">
                     <div class="absolute right-2 top-2">
                         <button class="copy-btn bg-surface border border-border rounded px-2 py-1 text-xs hover:bg-dark"
                             data-target="#python-content code">
@@ -452,7 +457,7 @@
                 </div>
 
                 <!-- cURL Tab -->
-                <div class="tab-content hidden h-full">
+                <div class="tab-content hidden h-full" data-tab="curl">
                     <div class="absolute right-2 top-2">
                         <button class="copy-btn bg-surface border border-border rounded px-2 py-1 text-xs hover:bg-dark"
                             data-target="#curl-content code">
@@ -529,7 +534,7 @@
 
                 btn.classList.add('active');
                 const tabName = btn.dataset.tab;
-                document.querySelector(`#${tabName}-content`).parentElement.classList.remove('hidden');
+                document.querySelector(`.tab-content[data-tab="${tabName}"]`).classList.remove('hidden');
 
                 // Re-highlight content when switching tabs
                 const activeCode = document.querySelector(`#${tabName}-content code`);
@@ -556,6 +561,22 @@
         // URL selector for multi-result HTML preview
         document.getElementById('html-result-select').addEventListener('change', (e) => {
             const index = parseInt(e.target.value);
+            if (lastCrawlResults && lastCrawlResults[index]) {
+                renderHtmlPreview(lastCrawlResults[index]);
+            }
+        });
+
+        document.getElementById('preview-source').addEventListener('change', () => {
+            const selectEl = document.getElementById('html-result-select');
+            const index = parseInt(selectEl.value || '0');
+            if (lastCrawlResults && lastCrawlResults[index]) {
+                renderHtmlPreview(lastCrawlResults[index]);
+            }
+        });
+
+        document.getElementById('sandbox-level').addEventListener('change', () => {
+            const selectEl = document.getElementById('html-result-select');
+            const index = parseInt(selectEl.value || '0');
             if (lastCrawlResults && lastCrawlResults[index]) {
                 renderHtmlPreview(lastCrawlResults[index]);
             }
@@ -892,19 +913,21 @@
                         });
                     }
 
-                    responseData = { stream: text };
                     const time = Math.round(performance.now() - startTime);
                     updateStatus('success', time, null, maxMemory);
                     document.querySelector('#response-content code').textContent = text;
                     document.querySelector('#response-content code').className = 'json hljs'; // Reset classes
                     forceHighlightElement(document.querySelector('#response-content code'));
                     lastEndpoint = endpoint;
-                    try {
-                        lastCrawlResults = text.trim().split('\n')
-                            .filter(l => l.trim())
-                            .map(l => JSON.parse(l))
-                            .filter(obj => obj.url || obj.html);
-                    } catch(e) { lastCrawlResults = null; }
+                    lastCrawlResults = text.trim().split('\n')
+                        .filter(l => l.trim())
+                        .reduce((acc, l) => {
+                            try {
+                                const obj = JSON.parse(l);
+                                if (obj.url || obj.html) acc.push(obj);
+                            } catch(e) { /* skip lines that aren't valid JSON */ }
+                            return acc;
+                        }, []);
                     populateHtmlTab();
                 } else {
                     // Regular request (handles /crawl and /md)
@@ -958,7 +981,7 @@
                     2
                 );
                 forceHighlightElement(document.querySelector('#response-content code'));
-                lastEndpoint = document.getElementById('endpoint').value;
+                lastEndpoint = endpoint;
                 lastCrawlResults = null;
                 updateHtmlTabState();
             }
@@ -1090,7 +1113,17 @@
         function renderHtmlPreview(result) {
             if (!result) return;
 
-            const htmlContent = result.html || '';
+            const previewSource = document.getElementById('preview-source')?.value || 'raw';
+            const hasCleaned = !!result.cleaned_html;
+            const htmlContent = (
+                previewSource === 'cleaned'
+                    ? (result.cleaned_html || result.html || '')
+                    : (result.html || '')
+            );
+            const fallbackBadge = document.getElementById('cleaned-fallback-badge');
+            if (fallbackBadge) {
+                fallbackBadge.classList.toggle('hidden', !(previewSource === 'cleaned' && !hasCleaned));
+            }
             const statusCode = result.status_code;
             const responseHeaders = result.response_headers || {};
             const requestedUrl = result.url || '';
@@ -1254,7 +1287,7 @@
                     htmlTabBtn.classList.remove('active');
                     document.querySelector('[data-tab="response"]').classList.add('active');
                     document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
-                    document.querySelector('#response-content').parentElement.classList.remove('hidden');
+                    document.querySelector('.tab-content[data-tab="response"]').classList.remove('hidden');
                 }
             }
         }
@@ -1280,7 +1313,6 @@
             }
 
             renderHtmlPreview(lastCrawlResults[0]);
-            initCopyButtons();
         }
 
         function forceHighlightElement(element) {
@@ -1305,7 +1337,9 @@
         // Initialize clipboard for all copy buttons
         function initCopyButtons() {
             document.querySelectorAll('.copy-btn').forEach(btn => {
-                new  ClipboardJS(btn, {
+                if (btn.dataset.clipboardInitialized) return;
+                btn.dataset.clipboardInitialized = 'true';
+                new ClipboardJS(btn, {
                     text: () => {
                         const target = document.querySelector(btn.dataset.target);
                         return target ? target.textContent : '';

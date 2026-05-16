@@ -146,7 +146,7 @@ class AsyncWebCrawler:
 
         # Initialize crawler strategy
         params = {k: v for k, v in kwargs.items() if k in [
-            "browser_config", "logger"]}
+            "browser_config", "logger", "browser_adapter"]}
         self.crawler_strategy = crawler_strategy or AsyncPlaywrightCrawlerStrategy(
             browser_config=browser_config,
             logger=self.logger,
@@ -207,6 +207,38 @@ class AsyncWebCrawler:
         """异步空上下文管理器"""
         yield
 
+    @staticmethod
+    def _equal(v, d) -> bool:
+        """Recursively compare two values: simple types via ==, complex objects via vars()."""
+        if type(v) is not type(d):
+            return False
+        if isinstance(v, (str, int, float, bool, type(None))):
+            return v == d
+        if isinstance(v, (list, tuple)):
+            return len(v) == len(d) and all(AsyncWebCrawler._equal(a, b) for a, b in zip(v, d))
+        if isinstance(v, dict):
+            return v.keys() == d.keys() and all(AsyncWebCrawler._equal(v[k], d[k]) for k in v)
+        try:
+            return AsyncWebCrawler._equal(vars(v), vars(d))
+        except TypeError:
+            return repr(v) == repr(d)
+
+    @staticmethod
+    def _diff_vars(config, default):
+        """Return a dict of {attr: value} for attributes that differ from default instance."""
+        _SIMPLE = (str, int, float, bool, type(None))
+        diff = {}
+        for k, v in vars(config).items():
+            if k.startswith("_"):
+                continue
+            d = vars(default).get(k)
+            if AsyncWebCrawler._equal(v, d):
+                continue
+            if isinstance(v, (list, dict, str)) and not v and d in (None, [], {}, ""):
+                continue
+            diff[k] = v if isinstance(v, _SIMPLE) else str(v)
+        return diff
+
     async def arun(
         self,
         url: str,
@@ -258,15 +290,29 @@ class AsyncWebCrawler:
 
                 if config.verbose:
                     import json as _json
-                    bc_dict = self.browser_config.to_dict() if hasattr(self.browser_config, 'to_dict') else vars(self.browser_config)
-                    cc_dict = config.to_dict() if hasattr(config, 'to_dict') else vars(config)
+
+                    # bc_dict = self.browser_config.to_dict() if hasattr(self.browser_config, 'to_dict') else vars(self.browser_config)
+                    # cc_dict = config.to_dict() if hasattr(config, 'to_dict') else vars(config)
+                    # # Full dump (original) — uncomment for debugging:
+                    # self.logger.info(
+                    #     message="Crawling {url}\n  BrowserConfig: {browser_config}\n  CrawlerRunConfig: {crawler_config}",
+                    #     tag="CRAWL",
+                    #     params={
+                    #         "url": url,
+                    #         "browser_config": _json.dumps({k: str(v) for k, v in bc_dict.items()}, default=str, ensure_ascii=False),
+                    #         "crawler_config": _json.dumps({k: str(v) for k, v in cc_dict.items()}, default=str, ensure_ascii=False),
+                    #     },
+                    # )
+
+                    bc_diff = self._diff_vars(self.browser_config, BrowserConfig())
+                    cc_diff = self._diff_vars(config, CrawlerRunConfig())
                     self.logger.info(
-                        message="Crawling {url}\n  BrowserConfig: {browser_config}\n  CrawlerRunConfig: {crawler_config}",
+                        message="Crawling {url} (non-default config)\n  BrowserConfig: {browser_config}\n  CrawlerRunConfig: {crawler_config}",
                         tag="CRAWL",
                         params={
                             "url": url,
-                            "browser_config": _json.dumps({k: str(v) for k, v in bc_dict.items()}, default=str, ensure_ascii=False),
-                            "crawler_config": _json.dumps({k: str(v) for k, v in cc_dict.items()}, default=str, ensure_ascii=False),
+                            "browser_config": _json.dumps(bc_diff, default=str, ensure_ascii=False),
+                            "crawler_config": _json.dumps(cc_diff, default=str, ensure_ascii=False),
                         },
                     )
 

@@ -34,9 +34,9 @@ This guide covers both features and helps you choose the right approach for your
 - You're willing to trade some performance for better evasion
 
 ### Best Practice: Progressive Enhancement
-1. **Start with**: Regular browser + Stealth mode
-2. **If blocked**: Switch to Undetected browser
-3. **If still blocked**: Combine Undetected browser + Stealth mode
+1. **Start with**: Playwright + Stealth mode (`enable_stealth=True` + behavioral config)
+2. **If blocked**: Switch to Undetected browser (Patchright) for binary-level evasion
+3. **If still blocked**: Add proxy rotation / session management via `CrawlerRunConfig`
 
 ## Stealth Mode
 
@@ -118,32 +118,102 @@ asyncio.run(main())
 
 ## Combining Both Features
 
-For maximum evasion, combine stealth mode with undetected browser:
+**`enable_stealth` and `UndetectedAdapter` are mutually exclusive** and cannot be
+combined.  `playwright_stealth` injects evasion scripts via `add_init_script()`,
+which triggers a Patchright driver-layer bug that breaks DNS (see below).
+BrowserManager automatically skips StealthAdapter when `use_undetected=True`.
+
+For a JS-level stealth + behavioral evasion combo that works with pure Playwright
+(no Patchright dependency), use:
 
 ```python
-from crawl4ai import AsyncWebCrawler, BrowserConfig, UndetectedAdapter
-from crawl4ai.async_crawler_strategy import AsyncPlaywrightCrawlerStrategy
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 
-# Create browser config with stealth enabled
 browser_config = BrowserConfig(
-    enable_stealth=True,  # Enable stealth mode
-    headless=False
+    enable_stealth=True,   # playwright_stealth: JS-layer navigator/WebGL/plugin evasions
+    headless=True,
 )
 
-# Create undetected adapter
+crawl_config = CrawlerRunConfig(
+    simulate_user=True,         # mouse movements, human-like behavior
+    flatten_shadow_dom=True,    # open closed shadow roots
+    magic=True,                 # auto-dismiss overlays / consent popups
+    override_navigator=True,    # additional navigator property overrides
+)
+
+async with AsyncWebCrawler(config=browser_config) as crawler:
+    result = await crawler.arun("https://example.com", config=crawl_config)
+```
+
+## Patchright DNS Limitation — Important
+
+Patchright's driver layer has a bug: **any** call to `add_init_script()`
+(context-level or page-level) breaks DNS resolution, causing
+`ERR_NAME_NOT_RESOLVED` (Chromium) or `NS_ERROR_UNKNOWN_HOST` (Firefox) on
+subsequent `page.goto()` calls.  This affects both Chromium and Firefox
+engines equally.  Pure Playwright does NOT have this issue.
+
+### Affected Config Parameters
+
+When using `UndetectedAdapter` (Patchright), the following `CrawlerRunConfig`
+params would normally trigger `add_init_script()` — they are automatically
+adapted to work without it:
+
+| Parameter | Default behavior | Patchright behavior |
+|-----------|-----------------|-------------------|
+| `override_navigator=True` | `context.add_init_script("navigator_overrider")` | Skipped — Patchright binary patches already handle navigator evasion |
+| `simulate_user=True` | triggers navigator_overrider injection | Skipped (same reason) |
+| `magic=True` | triggers navigator_overrider injection | Skipped (same reason) |
+| `flatten_shadow_dom=True` | `context.add_init_script(attachShadow override)` | attachShadow patched via `page.evaluate()` after `goto()` completes (best-effort) |
+| `BrowserConfig.init_scripts` | user-provided init scripts injected | Skipped with warning log |
+| `capture_console_messages=True` | `page.add_init_script()` for console hook | Uses `page.on("console")` / `page.on("pageerror")` event listeners instead |
+
+### Technical Details
+
+The bug is in Patchright's driver layer implementation of CDP
+`Page.addScriptToEvaluateOnNewDocument`.  When the script-hook is registered
+before the network stack fully initializes, the DNS resolution module fails to
+start, making every subsequent navigation fail with a host-not-found error.
+
+Our fix:
+1. **Skip `add_init_script()` entirely** under Patchright for navigator
+   overrides, shadow DOM patches, and user init_scripts.
+2. **Use `page.evaluate()`** to patch `attachShadow` after page load
+   (best-effort — shadow roots created before this point remain closed).
+3. **Use event listeners** (`page.on("console")`, `page.on("pageerror")`)
+   instead of JS injection for console message capture.
+4. **Log a warning** when user-provided `init_scripts` are skipped.
+
+### Recommended Configurations
+
+**For sites with advanced anti-bot (Cloudflare, DataDome):**
+```python
+browser_config = BrowserConfig(headless=True)
 adapter = UndetectedAdapter()
+# enable_stealth should NOT be set — Patchright handles binary-level evasion
 
-# Create strategy with both features
-strategy = AsyncPlaywrightCrawlerStrategy(
-    browser_config=browser_config,
-    browser_adapter=adapter
+crawl_config = CrawlerRunConfig(
+    magic=True,                  # auto-dismiss popups
+    simulate_user=True,          # human-like behavior
+    flatten_shadow_dom=True,     # shadow DOM expansion (post-goto evaluate)
+    # override_navigator is NOT needed — Patchright handles it at binary level
 )
+```
 
-async with AsyncWebCrawler(
-    crawler_strategy=strategy,
-    config=browser_config
-) as crawler:
-    result = await crawler.arun("https://protected-site.com")
+**For sites with basic anti-bot (most sites):**
+```python
+browser_config = BrowserConfig(
+    enable_stealth=True,   # playwright_stealth JS evasions
+    headless=True,
+)
+# No UndetectedAdapter needed — pure Playwright works fine
+
+crawl_config = CrawlerRunConfig(
+    magic=True,
+    simulate_user=True,
+    flatten_shadow_dom=True,
+    override_navigator=True,  # Safe under Playwright (add_init_script works)
+)
 ```
 
 ## Examples
@@ -332,6 +402,14 @@ This command installs all necessary browser dependencies for both regular and un
 
 ## Limitations
 
+- **Patchright + add_init_script**: Cannot use `add_init_script()`
+  under Patchright due to driver-layer DNS bug.  Affected params
+  (`flatten_shadow_dom`, `override_navigator`, `init_scripts`) are
+  automatically adapted.  See "Patchright DNS Limitation" above.
+- **StealthAdapter previously broken**: Before the 2026-05 fix,
+  `enable_stealth=True` was silently non-functional — `StealthAdapter`
+  imported non-existent function names.  Now fixed to use the correct
+  `playwright_stealth.Stealth` class API.
 - **Performance**: Slightly slower than regular mode due to additional patches
 - **Headless Detection**: Some sites can still detect headless mode
 - **Resource Usage**: May use more resources than regular mode

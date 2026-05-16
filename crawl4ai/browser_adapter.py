@@ -149,7 +149,17 @@ class PlaywrightAdapter(BrowserAdapter):
 
 
 class StealthAdapter(BrowserAdapter):
-    """Adapter for Playwright with stealth features using playwright_stealth"""
+    """Adapter for Playwright with stealth features using playwright_stealth.
+
+    Uses the Stealth class (the only public API).  The old code tried to
+    import stealth_async / stealth_sync — those names never existed in any
+    release of playwright_stealth, so enable_stealth was silently broken.
+
+    Must NOT be combined with UndetectedAdapter / Patchright:
+    playwright_stealth injects via context.add_init_script(), which triggers
+    Patchright's driver-layer DNS bug.  BrowserManager enforces this mutual
+    exclusion — _stealth_adapter is only created when use_undetected=False.
+    """
 
     def __init__(self):
         self._console_script_injected = {}
@@ -160,20 +170,24 @@ class StealthAdapter(BrowserAdapter):
         """Check if playwright_stealth is importable and instantiate the Stealth helper."""
         try:
             from playwright_stealth import Stealth
+            self._stealth = Stealth()
+            return True
         except ImportError:
+            self._stealth = None
             return False
-        self._stealth = Stealth()
-        return True
 
     async def apply_stealth(self, page: Page):
-        """Apply stealth to a page if available"""
-        if not (self._stealth_available and self._stealth):
-            return
-        try:
-            await self._stealth.apply_stealth_async(page)
-        except Exception:
-            # Fail silently or log error depending on requirements
-            pass
+        """Inject playwright_stealth evasion scripts via add_init_script().
+
+        Safe under pure Playwright.  Under Patchright add_init_script()
+        breaks DNS; BrowserManager.__init__ already prevents this path
+        (self._stealth_adapter is None when use_undetected=True).
+        """
+        if self._stealth_available and self._stealth:
+            try:
+                await self._stealth.apply_stealth_async(page)
+            except Exception:
+                pass
 
     async def evaluate(self, page: Page, expression: str, arg: Any = None) -> Any:
         """Standard Playwright evaluate with stealth applied"""
@@ -269,145 +283,116 @@ class StealthAdapter(BrowserAdapter):
 
 
 class UndetectedAdapter(BrowserAdapter):
-    """Adapter for undetected browser automation with stealth features"""
-    
+    """Adapter for Patchright (undetected Chromium / Firefox).
+
+    CRITICAL: Patchright's driver layer has a bug where ANY add_init_script()
+    call (context or page level) breaks DNS resolution, causing
+    ERR_NAME_NOT_RESOLVED on subsequent page.goto().  Both Chromium and
+    Firefox engine are affected.
+
+    Therefore this adapter MUST NOT call add_init_script() anywhere.
+    Console / error capture uses the standard Playwright event system
+    (page.on("console") / page.on("pageerror")) instead of JS injection.
+    """
+
     def __init__(self):
-        self._console_script_injected = {}
-    
+        pass
+
     async def evaluate(self, page: UndetectedPage, expression: str, arg: Any = None) -> Any:
-        """Undetected browser evaluate with isolated context"""
-        # For most evaluations, use isolated context for stealth
-        # Only use non-isolated when we need to access our injected console capture
-        isolated = not (
-            "__console" in expression or 
-            "__captured" in expression or
-            "__error" in expression or
-            "window.__" in expression
-        )
-        
+        """Evaluate JS in the page.  Always uses isolated_context=True for
+        stealth; the old non-isolated path existed only to reach
+        window.__capturedConsole which is no longer used."""
         if arg is not None:
-            return await page.evaluate(expression, arg, isolated_context=isolated)
-        return await page.evaluate(expression, isolated_context=isolated)
-    
+            return await page.evaluate(expression, arg, isolated_context=True)
+        return await page.evaluate(expression, isolated_context=True)
+
     async def setup_console_capture(self, page: UndetectedPage, captured_console: List[Dict]) -> Optional[Callable]:
-        """Setup console capture using JavaScript injection for undetected browsers"""
-        if not self._console_script_injected.get(page, False):
-            await page.add_init_script("""
-                // Initialize console capture
-                window.__capturedConsole = [];
-                window.__capturedErrors = [];
-                
-                // Store original console methods
-                const originalConsole = {};
-                ['log', 'info', 'warn', 'error', 'debug'].forEach(method => {
-                    originalConsole[method] = console[method];
-                    console[method] = function(...args) {
-                        try {
-                            window.__capturedConsole.push({
-                                type: method,
-                                text: args.map(arg => {
-                                    try {
-                                        if (typeof arg === 'object') {
-                                            return JSON.stringify(arg);
-                                        }
-                                        return String(arg);
-                                    } catch (e) {
-                                        return '[Object]';
-                                    }
-                                }).join(' '),
-                                timestamp: Date.now()
-                            });
-                        } catch (e) {
-                            // Fail silently to avoid detection
-                        }
-                        
-                        // Call original method
-                        originalConsole[method].apply(console, args);
-                    };
-                });
-            """)
-            self._console_script_injected[page] = True
-        
-        return None  # No handler function needed for undetected browser
-    
+        """Setup console capture via event listener (NOT add_init_script).
+
+        Patchright's driver-layer DNS bug makes add_init_script() unsafe,
+        so we use the same Page.on("console") event mechanism as PlaywrightAdapter.
+        """
+
+        def handle_console_capture(msg):
+            try:
+                message_type = "unknown"
+                try:
+                    message_type = msg.type
+                except Exception:
+                    pass
+
+                message_text = "unknown"
+                try:
+                    message_text = msg.text
+                except Exception:
+                    pass
+
+                entry = {
+                    "type": message_type,
+                    "text": message_text,
+                    "timestamp": time.time(),
+                }
+                captured_console.append(entry)
+            except Exception as e:
+                captured_console.append({
+                    "type": "console_capture_error",
+                    "error": str(e),
+                    "timestamp": time.time(),
+                })
+
+        page.on("console", handle_console_capture)
+        return handle_console_capture
+
     async def setup_error_capture(self, page: UndetectedPage, captured_console: List[Dict]) -> Optional[Callable]:
-        """Setup error capture using JavaScript injection for undetected browsers"""
-        if not self._console_script_injected.get(page, False):
-            await page.add_init_script("""
-                // Capture errors
-                window.addEventListener('error', (event) => {
-                    try {
-                        window.__capturedErrors.push({
-                            type: 'error',
-                            text: event.message,
-                            stack: event.error ? event.error.stack : '',
-                            filename: event.filename,
-                            lineno: event.lineno,
-                            colno: event.colno,
-                            timestamp: Date.now()
-                        });
-                    } catch (e) {
-                        // Fail silently
-                    }
-                });
-                
-                // Capture unhandled promise rejections
-                window.addEventListener('unhandledrejection', (event) => {
-                    try {
-                        window.__capturedErrors.push({
-                            type: 'unhandledrejection',
-                            text: event.reason ? String(event.reason) : 'Unhandled Promise Rejection',
-                            stack: event.reason && event.reason.stack ? event.reason.stack : '',
-                            timestamp: Date.now()
-                        });
-                    } catch (e) {
-                        // Fail silently
-                    }
-                });
-            """)
-            self._console_script_injected[page] = True
-        
-        return None  # No handler function needed for undetected browser
-    
+        """Setup error capture via event listener (NOT add_init_script).
+
+        Same reason as setup_console_capture — avoids Patchright's DNS bug.
+        """
+
+        def handle_pageerror_capture(err):
+            try:
+                error_message = "Unknown error"
+                try:
+                    error_message = err.message
+                except Exception:
+                    pass
+
+                error_stack = ""
+                try:
+                    error_stack = err.stack
+                except Exception:
+                    pass
+
+                captured_console.append({
+                    "type": "error",
+                    "text": error_message,
+                    "stack": error_stack,
+                    "timestamp": time.time(),
+                })
+            except Exception as e:
+                captured_console.append({
+                    "type": "pageerror_capture_error",
+                    "error": str(e),
+                    "timestamp": time.time(),
+                })
+
+        page.on("pageerror", handle_pageerror_capture)
+        return handle_pageerror_capture
+
     async def retrieve_console_messages(self, page: UndetectedPage) -> List[Dict]:
-        """Retrieve captured console messages and errors from the page"""
-        messages = []
-        
-        try:
-            # Get console messages
-            console_messages = await page.evaluate(
-                "() => { const msgs = window.__capturedConsole || []; window.__capturedConsole = []; return msgs; }",
-                isolated_context=False
-            )
-            messages.extend(console_messages)
-            
-            # Get errors
-            errors = await page.evaluate(
-                "() => { const errs = window.__capturedErrors || []; window.__capturedErrors = []; return errs; }",
-                isolated_context=False
-            )
-            messages.extend(errors)
-            
-            # Convert timestamps from JS to Python format
-            for msg in messages:
-                if 'timestamp' in msg and isinstance(msg['timestamp'], (int, float)):
-                    msg['timestamp'] = msg['timestamp'] / 1000.0  # Convert from ms to seconds
-                    
-        except Exception:
-            # If retrieval fails, return empty list
-            pass
-        
-        return messages
-    
+        """Messages are captured into captured_console list via events — no
+        JS-side extraction needed."""
+        return []
+
     async def cleanup_console_capture(self, page: UndetectedPage, handle_console: Optional[Callable], handle_error: Optional[Callable]):
-        """Clean up for undetected browser - retrieve final messages"""
-        # For undetected browser, we don't have event listeners to remove
-        # but we should retrieve any final messages
-        final_messages = await self.retrieve_console_messages(page)
-        return final_messages
-    
+        """Remove event listeners registered during setup."""
+        if handle_console:
+            page.remove_listener("console", handle_console)
+        if handle_error:
+            page.remove_listener("pageerror", handle_error)
+
     def get_imports(self) -> tuple:
-        """Return undetected browser imports"""
+        """Return Patchright imports"""
         from patchright.async_api import Page, Error
         from patchright.async_api import TimeoutError as PlaywrightTimeoutError
         return Page, Error, PlaywrightTimeoutError
