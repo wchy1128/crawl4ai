@@ -130,10 +130,13 @@ def get_run_config_dict(config: dict) -> dict:
     """Extract run config dict from the loaded config (supports both run_config and legacy base_config)."""
     crawler = config.get("crawler", {})
     result = dict(crawler.get("run_config", crawler.get("base_config", {})))
-    # Include crawler-level verbose (overrides run_config.verbose if present)
+    # Include crawler-level verbose/verbose_ext (overrides run_config if present)
     crawler_verbose = crawler.get("verbose")
     if crawler_verbose is not None:
         result["verbose"] = crawler_verbose
+    crawler_verbose_ext = crawler.get("verbose_ext")
+    if crawler_verbose_ext is not None:
+        result["verbose_ext"] = crawler_verbose_ext
     # Inject the default user JS file as js_code unless the config already provides one.
     if _USER_JS and "js_code" not in result:
         result["js_code"] = _USER_JS

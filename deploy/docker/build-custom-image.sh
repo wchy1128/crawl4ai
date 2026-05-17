@@ -26,7 +26,10 @@ echo "  Base image : ${BASE_IMAGE}"
 echo "  Output tag : ${TAG}"
 echo "  GitHub repo: ${GITHUB_REPO}"
 echo "  Branch     : ${GITHUB_BRANCH}"
+echo "  Script dir : ${SCRIPT_DIR}"
 echo "========================================="
+
+cd "${SCRIPT_DIR}"
 
 # Make sure the base image exists locally
 if ! docker image inspect "${BASE_IMAGE}" >/dev/null 2>&1; then
@@ -34,14 +37,15 @@ if ! docker image inspect "${BASE_IMAGE}" >/dev/null 2>&1; then
     docker pull "${BASE_IMAGE}"
 fi
 
-# No build context needed — pipe Dockerfile via stdin
 docker build \
+    --progress=plain \
     --no-cache \
     --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
     --build-arg "GITHUB_REPO=${GITHUB_REPO}" \
     --build-arg "GITHUB_BRANCH=${GITHUB_BRANCH}" \
     -t "${TAG}" \
-    - < "${SCRIPT_DIR}/Dockerfile.custom"
+    -f ./Dockerfile.custom \
+    .
 
 echo ""
 echo "========================================="

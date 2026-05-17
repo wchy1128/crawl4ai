@@ -1200,6 +1200,7 @@ Always return valid, properly formatted JSON."""
 
         browser_cfg.verbose = effective_verbose
         crawler_cfg.verbose = effective_verbose
+        crawler_cfg.verbose_ext = config.get("VERBOSE_EXT", False)
 
         # Get JSON output config (priority: CLI flag > global config)
         if json_ensure_ascii is not None:
