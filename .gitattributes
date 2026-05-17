@@ -10,3 +10,7 @@ docs/md_v2/* linguist-documentation
 
 # Exclude HTML from language statistics
 *.html linguist-detectable=false
+
+# Force LF for shell scripts and Dockerfiles (Linux compatibility)
+deploy/docker/*.sh text eol=lf
+deploy/docker/Dockerfile.custom text eol=lf

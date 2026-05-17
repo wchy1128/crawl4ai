@@ -1489,6 +1489,7 @@ class CrawlerRunConfig():
         preserve_https_for_internal_links: bool = False,
         # Debugging and Logging Parameters
         verbose: bool = False,
+        verbose_ext: bool = False,
         log_console: bool = False,
         # Network and Console Capturing Parameters
         capture_network_requests: bool = False,
@@ -1631,6 +1632,7 @@ class CrawlerRunConfig():
 
         # Debugging and Logging Parameters
         self.verbose = verbose
+        self.verbose_ext = verbose_ext
         self.log_console = log_console
         
         # Network and Console Capturing Parameters
@@ -1982,6 +1984,7 @@ class CrawlerRunConfig():
             "score_links": self.score_links,
             "preserve_https_for_internal_links": self.preserve_https_for_internal_links,
             "verbose": self.verbose,
+            "verbose_ext": self.verbose_ext,
             "log_console": self.log_console,
             "capture_network_requests": self.capture_network_requests,
             "capture_console_messages": self.capture_console_messages,

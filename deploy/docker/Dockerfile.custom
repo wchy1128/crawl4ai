@@ -20,7 +20,12 @@ ARG GITHUB_BRANCH=main
 # 1. Clone your fork
 RUN git clone --depth 1 --branch ${GITHUB_BRANCH} ${GITHUB_REPO} /tmp/crawl4ai
 
-# 2. Reinstall the crawl4ai library
+# 2. Show current patch content
+RUN echo ">>>>>>>>>> Patch commit(s):" && \
+    cd /tmp/crawl4ai && git log --oneline -5 && \
+    echo "<<<<<<<<<<"
+
+# 3. Reinstall the crawl4ai library
 RUN pip install --no-cache-dir /tmp/crawl4ai && \
     python -c "import crawl4ai; print('crawl4ai library OK')"
 
