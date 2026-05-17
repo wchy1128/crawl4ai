@@ -9,15 +9,25 @@
  * Returns the full HTML string including shadow content.
  */
 (() => {
+    // Fast-path: custom serialization is only needed when shadow roots exist.
+    // For pages without shadow DOM, browser-native outerHTML is exact and
+    // avoids serialization edge cases that can lose content.
+    let hasAnyShadow = false;
+    const all = document.querySelectorAll('*');
+    for (let i = 0; i < all.length; i++) {
+        if (all[i].shadowRoot) { hasAnyShadow = true; break; }
+    }
+    if (!hasAnyShadow) return document.documentElement.outerHTML;
+
     const VOID = new Set([
         'area','base','br','col','embed','hr','img','input',
         'link','meta','param','source','track','wbr'
     ]);
 
-    // Serialize a DOM node. When it has a shadow root, switch to
-    // shadow-aware serialization that resolves <slot> elements.
+    const escText = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
     const serialize = (node) => {
-        if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+        if (node.nodeType === Node.TEXT_NODE) return escText(node.textContent);
         if (node.nodeType === Node.COMMENT_NODE) return '';
         if (node.nodeType !== Node.ELEMENT_NODE) return '';
 
@@ -51,7 +61,7 @@
     // <style> tags are skipped (scoped CSS, useless outside shadow).
     // <slot> tags are replaced with their assigned (projected) nodes.
     const serializeShadowChild = (node, host) => {
-        if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+        if (node.nodeType === Node.TEXT_NODE) return escText(node.textContent);
         if (node.nodeType === Node.COMMENT_NODE) return '';
         if (node.nodeType !== Node.ELEMENT_NODE) return '';
 
