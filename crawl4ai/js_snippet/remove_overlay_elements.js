@@ -5,16 +5,52 @@ async () => {
         return style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
     };
 
-    // Common selectors for popups and overlays
-    const commonSelectors = [
-        // Close buttons first
+    // ISSUE: Never remove elements that contain interactive form controls.
+    // These are legitimate app functionality areas (search bars, login forms,
+    // product drawers with input fields), not garbage overlays.
+    // Checks descendants, not just the element itself — a drawer <div> is not
+    // an input, but it contains inputs that must be protected.
+    const hasInteractiveControls = (elem) =>
+        elem.matches("input, textarea, select, form") ||
+        elem.querySelector("input, textarea, select, form, button[type='submit']");
+
+    // Unified safety guard — all removal paths must pass this check.
+    // Each condition targets a specific historical false-positive pattern.
+    const isSafeToRemove = (elem) => {
+        // ISSUE: [class*="dialog" i] matches Wikipedia <body class="uls-dialog-sticky-hide">.
+        // Never remove structural root elements regardless of what selectors match.
+        if (elem === document.documentElement || elem === document.body) return false;
+
+        // Never remove elements containing interactive form controls
+        if (hasInteractiveControls(elem)) return false;
+
+        // ISSUE: fixed top navigation bars span full viewport width with high
+        // z-index on documentation sites. Removing them makes the next content
+        // container become the first layout element and get falsely removed too.
+        const rect = elem.getBoundingClientRect();
+        if (rect.top <= 5 && (
+            elem.matches('nav, header, [role="navigation"], [role="banner"]') ||
+            elem.querySelector('nav, header, [role="navigation"], [role="banner"]')
+        )) return false;
+
+        return true;
+    };
+
+    // ---- Selectors ----
+
+    // Step 1 only: close/dismiss buttons to click (non-destructive dismissal)
+    const closeButtonSelectors = [
         'button[class*="close" i]',
         'button[class*="dismiss" i]',
         'button[aria-label*="close" i]',
         'button[title*="close" i]',
         'a[class*="close" i]',
         'span[class*="close" i]',
+    ];
 
+    // Step 3 only: elements that declare themselves as overlays via class/role.
+    // All matches must pass size and safety guards before removal.
+    const overlaySelectors = [
         // Cookie notices
         '[class*="cookie-banner" i]',
         '[id*="cookie-banner" i]',
@@ -25,20 +61,24 @@ async () => {
         '[class*="newsletter" i]',
         '[class*="subscribe" i]',
 
-        // Generic popups/modals
+        // Generic popups/modals — keyword-based matching is aggressive and
+        // may hit false positives. Protected by size guard and safety checks.
         '[class*="popup" i]',
         '[class*="modal" i]',
         '[class*="overlay" i]',
-        // ISSUE: [class*="dialog" i] may match non-dialog elements, e.g. Wikipedia's body
-        // has class "uls-dialog-sticky-hide" which contains "dialog" but is just a CSS flag,
-        // not an actual dialog element. Protected by structural root guard below.
+        // ISSUE: [class*="dialog" i] may match non-dialog elements, e.g.
+        // Wikipedia <body class="uls-dialog-sticky-hide"> which contains
+        // "dialog" but is just a CSS flag, not an actual dialog element.
+        // Protected by root-element guard in isSafeToRemove.
         '[class*="dialog" i]',
         '[role="dialog"]',
         '[role="alertdialog"]',
     ];
 
-    // Try to click close buttons first
-    for (const selector of commonSelectors.slice(0, 6)) {
+    // ================================================================
+    // Step 1: Non-destructive dismissal — click close buttons first
+    // ================================================================
+    for (const selector of closeButtonSelectors) {
         const closeButtons = document.querySelectorAll(selector);
         for (const button of closeButtons) {
             if (isVisible(button)) {
@@ -52,115 +92,127 @@ async () => {
         }
     }
 
-    // Remove remaining overlay elements
+    // ================================================================
+    // Step 2: Visual heuristic — one full-DOM scan, two independent branches
+    // ================================================================
+    const vh = window.innerHeight;
     const allElements = document.querySelectorAll("*");
     for (const elem of allElements) {
-        // Never remove structural root elements — guards against selectors like
-        // [class*="dialog" i] matching <body> with class "uls-dialog-sticky-hide"
+        // Never remove structural root elements
         if (elem === document.documentElement || elem === document.body) continue;
+        // Skip descendants of already-removed ancestors (branch A removal side-effect)
+        if (!elem.isConnected) continue;
 
-        const style = window.getComputedStyle(elem);
-        const zIndex = parseInt(style.zIndex);
-        const position = style.position;
-
-        if (!isVisible(elem)) continue;
-        if (!(zIndex > 999 || position === "fixed" || position === "absolute")) continue;
-        // ISSUE: original code removed tiny elements (accessibility labels, screen reader text)
-        // because position:absolute + rgba(0,0,0,0) background matched. Wikipedia had 100+ such
-        // elements (cite-accessibility-label, vector-toc-toggle, etc.).
-        // Fix: require minimum size so only real overlays are removed.
+        // Cheap pre-filter: tiny elements are never overlays.
+        // Avoids expensive getComputedStyle on them.
+        // ISSUE: original code removed tiny position:absolute elements with
+        // rgba(0,0,0,0) background — screen-reader labels, accessibility hints.
+        // Wikipedia had 100+ such elements (cite-accessibility-label, etc.).
         if (elem.offsetWidth < 30 && elem.offsetHeight < 30) continue;
         if (elem.offsetWidth * elem.offsetHeight < 900) continue;
 
-        const isLarge = elem.offsetWidth > window.innerWidth * 0.5 ||
-            elem.offsetHeight > window.innerHeight * 0.5;
-        // ISSUE: backgroundColor.includes("rgba") matched fully transparent backgrounds
-        // like rgba(0,0,0,0), which are common for layout/accessibility elements, not overlays.
-        // Fix: parse alpha value and only match semi-transparent (alpha > 0 and < 1).
-        const bg = style.backgroundColor;
-        const bgAlpha = bg.includes("rgba") ? parseFloat(bg.split(",").pop()) : 1;
-        const hasSemiTransBg = bgAlpha > 0 && bgAlpha < 1;
-        const hasLowOpacity = parseFloat(style.opacity) < 1;
+        const style = window.getComputedStyle(elem);
+        if (!isVisible(elem)) continue;
 
-        // ISSUE: position:fixed/absolute is widely used for layout (headers, backgrounds,
-        // search boxes) not just overlays. Both Baidu and Bing homepages use position:fixed
-        // with low z-index for core UI. isLarge alone causes false positives.
-        // Fix: only trust isLarge for high z-index (> 999) elements. For low z-index
-        // elements, require overlay evidence (semi-transparent background or low opacity).
-        // ISSUE: fixed top navigation bars often span the full viewport width with high z-index
-        // (e.g. documentation site headers). Removing them can make a following content
-        // container become the first matching layout element and get styled/removed as nav too.
-        // Fix: skip likely top navigation/header containers before applying overlay removal.
-        const rect = elem.getBoundingClientRect();
-        const isLikelyTopNavigation = rect.top <= 5 && (
-            elem.matches('nav, header, [role="navigation"], [role="banner"]') ||
-            elem.querySelector('nav, header, [role="navigation"], [role="banner"]')
-        );
-        if (isLikelyTopNavigation) continue;
+        // ISSUE: pointer-events: none means the element is explicitly marked
+        // as a non-interactive decorative layer (tooltips, visual effects).
+        // These are not blocking overlays that need removal.
+        if (style.pointerEvents === "none") continue;
 
-        if (zIndex > 999) {
-            if (isLarge || hasSemiTransBg || hasLowOpacity) {
+        const zIndex = parseInt(style.zIndex);
+        const position = style.position;
+
+        // ---- Branch A: Overlay detection ----
+        // Detects elements that look like overlays based on CSS layering +
+        // visual evidence (semi-transparency or low opacity).
+        if (zIndex > 999 || position === "fixed" || position === "absolute") {
+            const bg = style.backgroundColor;
+            // ISSUE: backgroundColor includes "rgba" matches fully transparent
+            // backgrounds like rgba(0,0,0,0), common for layout/accessibility
+            // elements. Parse alpha and only treat semi-transparent (0 < alpha < 1)
+            // as overlay evidence.
+            const bgAlpha = bg.includes("rgba") ? parseFloat(bg.split(",").pop()) : 1;
+            const hasSemiTransBg = bgAlpha > 0 && bgAlpha < 1;
+            const hasLowOpacity = parseFloat(style.opacity) < 1;
+
+            // ISSUE: isLarge (width > 50vw || height > 50vh) was previously
+            // a standalone removal trigger for zIndex > 999 elements. Removed
+            // because large panels with high z-index and opaque backgrounds
+            // are normal app UI (e.g. Aliyun product drawer 820×909,
+            // zIdx=1003, bg=#fff), not overlay backdrops.
+            // Overlays MUST have semi-transparent background or low opacity
+            // as visual evidence. If future sites reveal opaque full-screen
+            // custom popups that escape this, isLarge could be reinstated as
+            // a secondary signal (requiring co-occurrence with other overlay
+            // indicators), never as a standalone trigger.
+            const shouldRemoveByOverlay =
+                (zIndex > 999 && (hasSemiTransBg || hasLowOpacity)) ||
+                ((position === "fixed" || position === "absolute") && (hasSemiTransBg || hasLowOpacity));
+
+            if (shouldRemoveByOverlay && isSafeToRemove(elem)) {
                 elem.remove();
+                continue; // Removed, skip branch B
             }
-        } else {
-            if (hasSemiTransBg || hasLowOpacity) {
+        }
+
+        // ---- Branch B: Edge chrome detection ----
+        // Detects fixed-position UI chrome pinned to viewport edges
+        // (cookie bars, ad strips, notification bars).
+        // ISSUE: Only checks position:fixed, NOT sticky.
+        // position:sticky is a document-flow layout property used for
+        // legitimate content structure (sticky table headers, sticky TOC,
+        // sticky sidebars), not UI chrome. The original code included sticky
+        // which caused false removal of <thead> and similar structural elements.
+        if (position === "fixed") {
+            const rect = elem.getBoundingClientRect();
+            // Skip large elements that are likely content, not chrome.
+            // e.g. Wikipedia sticky TOC, large notification panels.
+            if (rect.height > vh * 0.25) continue;
+
+            const nearTop = rect.top <= 5;
+            const nearBottom = rect.bottom >= vh - 5;
+
+            if ((nearTop || nearBottom) && isSafeToRemove(elem)) {
                 elem.remove();
             }
         }
     }
 
-    // Remove elements matching common selectors
-    for (const selector of commonSelectors) {
+    // ================================================================
+    // Step 3: Semantic selector-based removal
+    // ================================================================
+    for (const selector of overlaySelectors) {
         try {
             const elements = document.querySelectorAll(selector);
             elements.forEach((elem) => {
-                // Never remove structural root elements — same guard as above
-                if (elem === document.documentElement || elem === document.body) return;
-                if (isVisible(elem)) {
-                    elem.remove();
-                }
+                if (!isVisible(elem)) return;
+                if (!isSafeToRemove(elem)) return;
+
+                // ISSUE: generic keyword selectors (popup, modal, overlay,
+                // dialog) can match tiny decorative elements. Require
+                // minimum size to avoid false positives.
+                if (elem.offsetWidth < 30 && elem.offsetHeight < 30) return;
+                if (elem.offsetWidth * elem.offsetHeight < 900) return;
+
+                // ISSUE: pointer-events: none marks non-interactive
+                // decorative elements that happen to match keyword selectors.
+                const style = window.getComputedStyle(elem);
+                if (style.pointerEvents === "none") return;
+
+                elem.remove();
             });
         } catch (e) {
             console.warn("remove_overlay_elements: selector error", selector, e.toString());
         }
     }
 
-    // Remove fixed/sticky elements at the top/bottom edges of the viewport
-    // (navigation bars, ad strips, notification bars, floating buttons)
-    // Skip large elements that are likely content (e.g. Wikipedia sticky TOC, table headers)
-    const elements = document.querySelectorAll("*");
-    elements.forEach((elem) => {
-        // Never remove structural root elements — same guard as above
-        if (elem === document.documentElement || elem === document.body) return;
-        const style = window.getComputedStyle(elem);
-        if (!(style.position === "fixed" || style.position === "sticky") || !isVisible(elem)) {
-            return;
-        }
-        const rect = elem.getBoundingClientRect();
-        const vh = window.innerHeight;
-        // Skip large elements (likely content, not UI chrome)
-        if (rect.height > vh * 0.25) {
-            return;
-        }
-        // Must be near top or bottom edge of viewport
-        const nearTop = rect.top <= 5;
-        const nearBottom = rect.bottom >= vh - 5;
-        // ISSUE: same top navigation/header false positive as the high z-index heuristic above.
-        // Keep real site navigation while still allowing bottom cookie/ad bars to be removed.
-        if (nearTop && (
-            elem.matches('nav, header, [role="navigation"], [role="banner"]') ||
-            elem.querySelector('nav, header, [role="navigation"], [role="banner"]')
-        )) {
-            return;
-        }
-        if (nearTop || nearBottom) {
-            elem.remove();
-        }
-    });
-
-    // Remove margin-right and padding-right from body (often added by modal scripts)
-    // ISSUE: previous elements removal could destroy <body>, making document.body null.
-    // Fix: null guard before accessing body.style.
+    // ================================================================
+    // Step 4: Body style cleanup
+    // ================================================================
+    // Remove margin-right and padding-right from body (often added by modal
+    // scripts to compensate for scrollbar removal).
+    // ISSUE: previous element removal could have destroyed <body>, making
+    // document.body null. Null guard required before accessing body.style.
     if (document.body) {
         document.body.style.marginRight = "0px";
         document.body.style.paddingRight = "0px";
