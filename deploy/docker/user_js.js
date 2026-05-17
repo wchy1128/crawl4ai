@@ -1,4 +1,21 @@
-// Generic expand/read-more script.
+// ===== Cloudflare Challenge polling (all domains) =====
+// Polls until Cloudflare's interstitial disappears.
+// On normal pages: one DOM query, resolves instantly (zero impact).
+await new Promise((resolve) => {
+    const poll = () => {
+        if (
+            !document.querySelector("#challenge-form") &&
+            !document.querySelector(".cf-browser-verification")
+        ) {
+            resolve();
+        } else {
+            setTimeout(poll, 500);
+        }
+    };
+    poll();
+});
+
+// ===== Expand/read-more (whitelisted domains only) =====
 
 const whitelist = ["zhihu.com", "csdn.net", "stackoverflow.com"];
 if (!whitelist.some((domain) => location.hostname === domain || location.hostname.endsWith(`.${domain}`))) {
