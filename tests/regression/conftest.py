@@ -445,6 +445,140 @@ DEEP_LEAF_TEMPLATE = """\
 </body>
 </html>"""
 
+SHADOW_DOM_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Shadow DOM Test Page</title>
+</head>
+<body>
+    <h1>Shadow DOM Test Page</h1>
+    <p>This page contains web components with shadow DOM for testing flatten_shadow_dom.</p>
+
+    <!-- Open shadow DOM component -->
+    <div id="host-open">
+        <template shadowrootmode="open">
+            <style>span { color: red; }</style>
+            <div class="shadow-content">
+                <h2>Content Inside Open Shadow Root</h2>
+                <p>This text is inside an open shadow DOM and should be captured.</p>
+                <slot name="greeting"><span>Default slot content</span></slot>
+            </div>
+        </template>
+        <span slot="greeting">Hello from light DOM!</span>
+    </div>
+
+    <!-- Closed shadow DOM component (simulated with JS) -->
+    <div id="host-closed">Closed shadow host - content injected by JS</div>
+
+    <!-- Regular light DOM for comparison -->
+    <div id="regular-content">
+        <h2>Regular Light DOM Content</h2>
+        <p>This content is in the regular light DOM and should always be captured.</p>
+        <ul>
+            <li>Item 1: Always visible</li>
+            <li>Item 2: Always visible</li>
+            <li>Item 3: Always visible</li>
+        </ul>
+    </div>
+
+    <script>
+        // Create a closed shadow root - will become open via init script patching
+        (function() {
+            var host = document.getElementById("host-closed");
+            if (host && host.attachShadow) {
+                var root = host.attachShadow({ mode: "closed" });
+                root.innerHTML = '<style>p { font-weight: bold; }</style>' +
+                    '<div class="nested-shadow">' +
+                    '<h3>Content Inside Closed Shadow Root</h3>' +
+                    '<p>This text is inside a closed shadow DOM.</p>' +
+                    '<ul><li>Closed shadow item A</li><li>Closed shadow item B</li></ul>' +
+                    '</div>';
+            }
+
+            // Custom element with shadow DOM
+            if (window.customElements) {
+                class ShadowCard extends HTMLElement {
+                    constructor() {
+                        super();
+                        var root = this.attachShadow({ mode: "open" });
+                        root.innerHTML = '<style>.card { border: 2px solid #333; padding: 10px; }</style>' +
+                            '<div class="card">' +
+                            '<h4><slot name="title">Default Title</slot></h4>' +
+                            '<p><slot name="body">Default body text.</slot></p>' +
+                            '</div>';
+                    }
+                }
+                try { customElements.define("shadow-card", ShadowCard); } catch(e) {}
+            }
+        })();
+    </script>
+
+    <!-- Custom element instances -->
+    <shadow-card>
+        <span slot="title">Custom Card Title</span>
+        <span slot="body">Custom card body text from light DOM.</span>
+    </shadow-card>
+
+    <shadow-card>
+        <!-- No slots provided, uses fallback content -->
+    </shadow-card>
+</body>
+</html>"""
+
+NO_SHADOW_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>No Shadow DOM Page</title>
+    <style>
+        .svelte-wf8082 { color: #333; }
+        .svelte-abc123 { font-size: 16px; }
+        .container { max-width: 800px; margin: 0 auto; }
+    </style>
+</head>
+<body>
+    <div class="container svelte-wf8082">
+        <nav class="sidebar svelte-abc123">
+            <h2>Documentation</h2>
+            <ul class="nav-list">
+                <li><a href="/docs/intro">Introduction</a></li>
+                <li><a href="/docs/guide">Guide</a></li>
+                <li><a href="/docs/api">API Reference</a></li>
+                <li><a href="/docs/examples">Examples</a></li>
+                <li><a href="/docs/faq">FAQ</a></li>
+            </ul>
+        </nav>
+        <main class="content">
+            <h1>Introduction</h1>
+            <p>This is a page styled with scoped CSS classes (similar to SvelteKit output).</p>
+            <p>It has <strong>no shadow DOM</strong> but uses component-scoped class names.</p>
+            <section>
+                <h2>Getting Started</h2>
+                <p>Follow these steps to get started with the framework.</p>
+                <ol>
+                    <li>Install the package</li>
+                    <li>Configure your project</li>
+                    <li>Start building</li>
+                </ol>
+            </section>
+            <section>
+                <h2>API Overview</h2>
+                <p>The API provides various endpoints for data access.</p>
+                <table>
+                    <tr><th>Endpoint</th><th>Method</th><th>Description</th></tr>
+                    <tr><td>/api/users</td><td>GET</td><td>List all users</td></tr>
+                    <tr><td>/api/users/:id</td><td>GET</td><td>Get user by ID</td></tr>
+                </table>
+            </section>
+        </main>
+    </div>
+    <footer class="svelte-footer">Documentation footer content</footer>
+</body>
+</html>"""
+
 IFRAME_HTML = """\
 <!DOCTYPE html>
 <html>
@@ -500,6 +634,12 @@ async def _regex_test_handler(request):
 
 async def _large_handler(request):
     return await _serve_html(LARGE_HTML)
+
+async def _shadow_dom_handler(request):
+    return await _serve_html(SHADOW_DOM_HTML)
+
+async def _no_shadow_handler(request):
+    return await _serve_html(NO_SHADOW_HTML)
 
 async def _iframe_handler(request):
     return await _serve_html(IFRAME_HTML)
@@ -573,6 +713,8 @@ def _create_app():
     app.router.add_get("/regex-test", _regex_test_handler)
     app.router.add_get("/large", _large_handler)
     app.router.add_get("/iframe-page", _iframe_handler)
+    app.router.add_get("/shadow-dom", _shadow_dom_handler)
+    app.router.add_get("/no-shadow", _no_shadow_handler)
     app.router.add_get("/redirect", _redirect_handler)
     app.router.add_get("/not-found", _not_found_handler)
     app.router.add_get("/slow", _slow_handler)
