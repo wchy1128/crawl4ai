@@ -57,6 +57,7 @@ security:
 # Crawler Configuration
 crawler:
   verbose: true
+  verbose_ext: false
   memory_threshold_percent: 95.0
   rate_limiter:
     enabled: true
