@@ -129,6 +129,11 @@ USER_SETTINGS = {
         "description": "Enable verbose output for database operations",
         "type": "boolean"
     },
+    "VERBOSE_EXT": {
+        "default": False,
+        "description": "Enable extra verbose output (config dump in arun, large output)",
+        "type": "boolean"
+    },
     "BROWSER_HEADLESS": {
         "default": True,
         "description": "Run browser in headless mode by default",

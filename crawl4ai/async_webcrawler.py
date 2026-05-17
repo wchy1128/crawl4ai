@@ -288,7 +288,7 @@ class AsyncWebCrawler:
             try:
                 self.logger.verbose = config.verbose
 
-                if config.verbose:
+                if config.verbose_ext:
                     import json as _json
 
                     # bc_dict = self.browser_config.to_dict() if hasattr(self.browser_config, 'to_dict') else vars(self.browser_config)
