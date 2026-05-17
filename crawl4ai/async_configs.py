@@ -1456,6 +1456,8 @@ class CrawlerRunConfig():
         scan_full_page: bool = False,
         scroll_delay: float = 0.2,
         max_scroll_steps: Optional[int] = None,
+        accumulate_on_scroll: bool = False,
+        accumulate_selector: str = "article",
         process_iframes: bool = False,
         flatten_shadow_dom: bool = False,
         remove_overlay_elements: bool = False,
@@ -1586,6 +1588,8 @@ class CrawlerRunConfig():
         self.scan_full_page = scan_full_page
         self.scroll_delay = scroll_delay
         self.max_scroll_steps = max_scroll_steps
+        self.accumulate_on_scroll = accumulate_on_scroll
+        self.accumulate_selector = accumulate_selector
         self.process_iframes = process_iframes
         self.flatten_shadow_dom = flatten_shadow_dom
         self.remove_overlay_elements = remove_overlay_elements
@@ -1949,6 +1953,8 @@ class CrawlerRunConfig():
             "scan_full_page": self.scan_full_page,
             "scroll_delay": self.scroll_delay,
             "max_scroll_steps": self.max_scroll_steps,
+            "accumulate_on_scroll": self.accumulate_on_scroll,
+            "accumulate_selector": self.accumulate_selector,
             "process_iframes": self.process_iframes,
             "flatten_shadow_dom": self.flatten_shadow_dom,
             "remove_overlay_elements": self.remove_overlay_elements,

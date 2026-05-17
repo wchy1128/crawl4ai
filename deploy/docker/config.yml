@@ -89,8 +89,8 @@ crawler:
     simulate_user: true
     word_count_threshold: 10
     only_text: false
-    wait_until: "domcontentloaded"
-    page_timeout: 60000
+    wait_until: "load"
+    page_timeout: 120000
     process_iframes: false
     magic: true
     remove_overlay_elements: true
@@ -102,7 +102,9 @@ crawler:
 
     scan_full_page: true
     scroll_delay: 0.3                   # 稍长的滚动间隔，更像人类
-    max_scroll_steps: 20
+    max_scroll_steps: 15
+    accumulate_on_scroll: false           # 虚拟列表页面滚动时累积克隆内容（如 x.com）
+    accumulate_selector: "article"        # 累积克隆的 CSS 选择器，默认 article 适用于多数站点
 
     max_retries: 2
     proxy_config:
