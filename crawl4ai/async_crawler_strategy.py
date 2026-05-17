@@ -534,7 +534,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
 
         # Reset downloaded files list for new crawl
         self._downloaded_files = []
-        
+
         # Initialize capture lists
         captured_requests = []
         captured_console = []
@@ -1004,7 +1004,11 @@ Element.prototype.attachShadow = function(init) {
                 scan_timeout = (config.page_timeout or 30000) / 1000  # ms to seconds
                 try:
                     await asyncio.wait_for(
-                        self._handle_full_page_scan(page, config.scroll_delay, config.max_scroll_steps),
+                        self._handle_full_page_scan(
+                            page, config.scroll_delay, config.max_scroll_steps,
+                            accumulate=config.accumulate_on_scroll,
+                            accumulate_selector=config.accumulate_selector,
+                        ),
                         timeout=scan_timeout,
                     )
                 except asyncio.TimeoutError:
@@ -1281,7 +1285,7 @@ Element.prototype.attachShadow = function(init) {
                     pass
 
     # async def _handle_full_page_scan(self, page: Page, scroll_delay: float = 0.1):
-    async def _handle_full_page_scan(self, page: Page, scroll_delay: float = 0.1, max_scroll_steps: Optional[int] = None):
+    async def _handle_full_page_scan(self, page: Page, scroll_delay: float = 0.1, max_scroll_steps: Optional[int] = None, accumulate: bool = False, accumulate_selector: str = "article"):
         """
         Helper method to handle full page scanning.
 
@@ -1314,6 +1318,34 @@ Element.prototype.attachShadow = function(init) {
             viewport_height = viewport_size.get(
                 "height", self.browser_config.viewport_height
             )
+
+            # --- SPA stabilization: wait for React hydration before scrolling ---
+            try:
+                _prev_h = (await self.get_page_dimensions(page))["height"]
+                for _settle_round in range(2):
+                    await asyncio.wait_for(asyncio.sleep(1.0), timeout=5.0)
+                    _cur_h = (await self.get_page_dimensions(page))["height"]
+                    _growth = (_cur_h - _prev_h) / max(_prev_h, 1)
+                    if _growth <= 0.15:
+                        break  # stable enough
+                    _prev_h = _cur_h
+            except asyncio.TimeoutError:
+                pass
+
+            # --- Accumulator setup for virtual-list pages (e.g. x.com) ---
+            if accumulate:
+                # Idempotent: remove leftover from a previous session page reuse
+                await self.adapter.evaluate(page, """
+                    () => {
+                        const old = document.getElementById('__crawl4ai_acc');
+                        if (old) old.remove();
+                        const acc = document.createElement('div');
+                        acc.id = '__crawl4ai_acc';
+                        acc.style.cssText = 'display:none';
+                        document.body.appendChild(acc);
+                    }
+                """)
+
             current_position = viewport_height
 
             # await page.evaluate(f"window.scrollTo(0, {current_position})")
@@ -1339,7 +1371,7 @@ Element.prototype.attachShadow = function(init) {
 
                 # Increment the step counter for max_scroll_steps tracking
                 scroll_step_count += 1
-                
+
                 # await page.evaluate(f"window.scrollTo(0, {current_position})")
                 # await asyncio.sleep(scroll_delay)
 
@@ -1349,6 +1381,29 @@ Element.prototype.attachShadow = function(init) {
 
                 if new_height > total_height:
                     total_height = new_height
+
+                # Clone visible elements into accumulator (for virtual-list sites like x.com)
+                if accumulate:
+                    _sel_escaped = accumulate_selector.replace("\\", "\\\\").replace("'", "\\'")
+                    await self.adapter.evaluate(page, f"""
+                        () => {{
+                            const acc = document.getElementById('__crawl4ai_acc');
+                            if (!acc) return;
+                            const items = document.querySelectorAll('{_sel_escaped}');
+                            const seen = new Set();
+                            for (const el of acc.children) {{
+                                const k = el.textContent?.trim();
+                                if (k) seen.add(k);
+                            }}
+                            for (const it of items) {{
+                                const k = it.textContent?.trim();
+                                if (k && !seen.has(k)) {{
+                                    seen.add(k);
+                                    acc.appendChild(it.cloneNode(true));
+                                }}
+                            }}
+                        }}
+                    """)
 
             # await page.evaluate("window.scrollTo(0, 0)")
             await self.safe_scroll(page, 0, 0)
