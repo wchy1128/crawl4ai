@@ -87,7 +87,9 @@ crawler:
   browser:
     use_undetected: true                   # 启用 Patchright 反检测引擎（绕 Cloudflare）
     kwargs:
-      headless: true
+      use_managed_browser: false          # 持久化浏览器 profile，保留 cookie/登录态
+      user_data_dir: ".\\profiles_tmp"  # 持久化浏览器用户数据目录
+      headless: false
       text_mode: false
       enable_stealth: false              # Patchright 已在二进制层处理，playwright-stealth 反而冲突
       # user_agent_mode: "random"        # 禁用：随机 UA 导致 Sec-Ch-Ua/UA 不一致（如 Edge UA + Chrome hint）
@@ -103,6 +105,7 @@ crawler:
       - "--no-sandbox"
       - "--disable-dev-shm-usage"
       - "--disable-gpu"
+      - "--remote-debugging-address=0.0.0.0"
       # 去掉以下特征旗，Cloudflare 会检测它们
       # - "--disable-web-security"
       # - "--allow-insecure-localhost"
