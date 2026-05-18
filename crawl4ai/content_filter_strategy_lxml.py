@@ -313,6 +313,12 @@ class PruningContentFilterLXML(PruningContentFilter):
     # Scoring (top-down pass)
     # ------------------------------------------------------------------ #
     def _should_remove(self, node, m: _NodeMetrics, metrics: Dict[object, _NodeMetrics]) -> bool:
+        # Skip pruning for <pre>/<code> nodes (parity with PruningContentFilter):
+        # syntax highlighters wrap every token in short-text <span>s whose
+        # text_density gets pruned, losing code content.
+        if node.tag in ("pre", "code"):
+            return False
+
         text_len = m.text_len
         tag_len = m.inner_len
 

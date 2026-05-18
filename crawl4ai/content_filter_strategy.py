@@ -722,8 +722,10 @@ class PruningContentFilter(RelevantContentFilter):
         if not node or not hasattr(node, "name") or node.name is None:
             return
 
-        # Skip pruning for preserved nodes — always keep them
-        if self._is_preserved(node):
+        # Skip pruning for preserved nodes — always keep them.
+        # Also skip <pre>/<code>: syntax highlighters (e.g. Sandpack) wrap every
+        # token in short-text <span>s whose text_density gets pruned, losing code.
+        if self._is_preserved(node) or node.name in ("pre", "code"):
             return
 
         text_len = len(node.get_text(strip=True))
