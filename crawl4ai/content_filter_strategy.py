@@ -692,6 +692,12 @@ class PruningContentFilter(RelevantContentFilter):
         if not node or not hasattr(node, "name") or node.name is None:
             return
 
+        # 跳过 <pre>/<code> 节点，不修剪其内部结构。
+        # 语法高亮渲染器（如 Sandpack）会用大量短文本 <span> 包裹每个符号，
+        # 这些 <span> 的 text_density 极低会被误删，导致代码内容丢失。
+        if node.name in ("pre", "code"):
+            return
+
         text_len = len(node.get_text(strip=True))
         tag_len = len(node.encode_contents().decode("utf-8"))
         link_text_len = sum(
