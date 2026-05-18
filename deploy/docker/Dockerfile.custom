@@ -14,6 +14,10 @@ FROM ${BASE_IMAGE}
 
 USER root
 
+# Install ss (iproute2) and socat for network debugging
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 socat \
+    && rm -rf /var/lib/apt/lists/*
+
 ARG GITHUB_REPO=https://github.com/wchy1128/crawl4ai.git
 ARG GITHUB_BRANCH=main
 
