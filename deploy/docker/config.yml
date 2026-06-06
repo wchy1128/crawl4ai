@@ -103,14 +103,14 @@ crawler:
       # (compose: security_opt: seccomp=...), then delete this flag and confirm
       # Chromium still starts. Tracked as a build-gated hardening item.
       - "--no-sandbox"
-      - "--disable-dev-shm-usage"
+      # - "--disable-dev-shm-usage"        # 映射了 /dev/shm:/dev/shm
       - "--disable-gpu"
-      - "--remote-debugging-address=0.0.0.0"
       # 去掉以下特征旗，Cloudflare 会检测它们
       # - "--disable-web-security"
       # - "--allow-insecure-localhost"
       # - "--ignore-certificate-errors"
       # - "--disable-software-rasterizer"
+      - "--window-position=0,0"
       - "--window-size=1920,1080"
   run_config:
     stream: false

@@ -268,11 +268,10 @@ continue_config.json
 
 .claude/
 .context/
+.codegraph/
 
 CLAUDE_MONITOR.md
 CLAUDE.md
-
-.claude/
 
 tests/**/test_site
 tests/**/reports
