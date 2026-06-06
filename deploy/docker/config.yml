@@ -79,14 +79,14 @@ crawler:
       # user_agent_mode: "random"        # 禁用：随机 UA 导致 Sec-Ch-Ua/UA 不一致（如 Edge UA + Chrome hint）
     extra_args:
       - "--no-sandbox"
-      - "--disable-dev-shm-usage"
+      # - "--disable-dev-shm-usage"        # 映射了 /dev/shm:/dev/shm
       - "--disable-gpu"
-      - "--remote-debugging-address=0.0.0.0"
       # 去掉以下特征旗，Cloudflare 会检测它们
       # - "--disable-web-security"
       # - "--allow-insecure-localhost"
       # - "--ignore-certificate-errors"
       # - "--disable-software-rasterizer"
+      - "--window-position=0,0"
       - "--window-size=1920,1080"
   run_config:
     stream: false
