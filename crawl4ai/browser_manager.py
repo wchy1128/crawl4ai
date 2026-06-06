@@ -234,7 +234,7 @@ class ManagedBrowser:
                 # “Opening in existing browser session.”
                 for f in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
                     fp = os.path.join(self.user_data_dir, f)
-                    if os.path.exists(fp):
+                    if os.path.lexists(fp):
                         os.remove(fp)
         except Exception as _e:
             # non-fatal — we'll try to start anyway, but log what happened
@@ -1593,6 +1593,36 @@ class BrowserManager:
                 )
             return None
 
+    async def _ensure_browser_alive(self):
+        """检测 managed browser 是否存活，若已断开则重启。"""
+        if not self.config.use_managed_browser:
+            return
+
+        if self.browser is not None and self.browser.is_connected():
+            return
+
+        if self.logger:
+            self.logger.info(
+                message="Managed browser disconnected, restarting...",
+                tag="BROWSER",
+            )
+
+        await self.close()
+
+        # close() 会把 managed_browser 设为 None，需要重建
+        if self.managed_browser is None:
+            self.managed_browser = ManagedBrowser(
+                browser_type=self.config.browser_type,
+                user_data_dir=self.config.user_data_dir,
+                headless=self.config.headless,
+                logger=self.logger,
+                debugging_port=self.config.debugging_port,
+                cdp_url=self.config.cdp_url,
+                browser_config=self.config,
+            )
+
+        await self.start()
+
     async def get_page(self, crawlerRunConfig: CrawlerRunConfig):
         """
         Get a page for the given session ID, creating a new one if needed.
@@ -1614,6 +1644,7 @@ class BrowserManager:
 
         # If using a managed browser, just grab the shared default_context
         if self.config.use_managed_browser:
+            await self._ensure_browser_alive()
             # If create_isolated_context is True, create isolated contexts for concurrent crawls
             # Uses the same caching mechanism as non-CDP mode: cache context by config signature,
             # but always create a new page. This prevents navigation conflicts while allowing
@@ -2137,7 +2168,10 @@ class BrowserManager:
         self._page_to_sig.clear()
 
         if self.browser:
-            await self.browser.close()
+            try:
+                await self.browser.close()
+            except Exception:
+                pass
             self.browser = None
 
         if self.managed_browser:
