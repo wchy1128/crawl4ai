@@ -109,7 +109,7 @@ class TestMCPBridgeSSEHandler:
             "deploy/docker/mcp_bridge.py"
         )
         # We can't fully import mcp_bridge (needs Docker deps), so check source
-        with open("deploy/docker/mcp_bridge.py") as f:
+        with open("deploy/docker/mcp_bridge.py", encoding="utf-8") as f:
             source = f.read()
 
         # Should have a class-based handler
@@ -118,7 +118,7 @@ class TestMCPBridgeSSEHandler:
 
     def test_mcp_bridge_no_async_def_sse_handler(self):
         """Should NOT have a plain async def _mcp_sse_handler."""
-        with open("deploy/docker/mcp_bridge.py") as f:
+        with open("deploy/docker/mcp_bridge.py", encoding="utf-8") as f:
             source = f.read()
 
         # The old buggy pattern should be gone
@@ -126,7 +126,7 @@ class TestMCPBridgeSSEHandler:
 
     def test_mcp_bridge_route_uses_class_instance(self):
         """Route should be created with _MCPSseApp() instance, not a function."""
-        with open("deploy/docker/mcp_bridge.py") as f:
+        with open("deploy/docker/mcp_bridge.py", encoding="utf-8") as f:
             source = f.read()
 
         assert "_MCPSseApp()" in source

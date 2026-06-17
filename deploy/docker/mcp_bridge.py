@@ -11,10 +11,14 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.routing import Route, Mount
 from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 import mcp.types as t
 from mcp.server.lowlevel.server import Server, NotificationOptions
 from mcp.server.models import InitializationOptions
+
+# mcp >= 1.10 wraps JSONRPCMessage in SessionMessage on internal streams.
+from mcp.shared.message import SessionMessage
 
 # ── opt‑in decorators ───────────────────────────────────────────
 def mcp_resource(name: str | None = None):
@@ -89,8 +93,12 @@ def attach_mcp(
     name: str | None = None,
     base_url: str,              # eg. "http://127.0.0.1:8020"
     timeout: float | None = None,  # httpx timeout in seconds; None = no limit
-) -> None:
-    """Call once after all routes are declared to expose WS+SSE MCP endpoints."""
+) -> StreamableHTTPSessionManager:
+    """Call once after all routes are declared to expose WS+SSE+Streamable HTTP MCP endpoints.
+
+    Returns the StreamableHTTPSessionManager; caller must enter its ``run()`` context
+    inside the FastAPI lifespan (see mcp/server/fastmcp/server.py:1044).
+    """
     server_name = name or app.title or "FastAPI-MCP"
     mcp = Server(server_name)
 
@@ -251,10 +259,10 @@ def attach_mcp(
         init_done = anyio.Event()
 
         async def srv_to_ws():
-            first = True 
+            first = True
             try:
                 async for msg in s2c_recv:
-                    await ws.send_json(msg.model_dump())
+                    await ws.send_json(msg.message.model_dump())
                     if first:
                         init_done.set()
                         first = False
@@ -268,11 +276,11 @@ def attach_mcp(
             try:
                 # 1st frame is always "initialize"
                 first = adapter.validate_python(await ws.receive_json())
-                await c2s_send.send(first)
+                await c2s_send.send(SessionMessage(message=first))
                 await init_done.wait()          # block until server ready
                 while True:
                     data = await ws.receive_json()
-                    await c2s_send.send(adapter.validate_python(data))
+                    await c2s_send.send(SessionMessage(message=adapter.validate_python(data)))
             except WebSocketDisconnect:
                 await c2s_send.aclose()
 
@@ -296,6 +304,24 @@ def attach_mcp(
     app.routes.append(Route(f"{base}/sse", endpoint=_MCPSseApp()))
     app.routes.append(Mount(f"{base}/messages", app=sse.handle_post_message))
 
+    # ── Streamable HTTP transport (MCP 2025-03-26) ───────────────
+    # Single endpoint at {base} handles POST (JSON-RPC), GET (SSE upgrade stream),
+    # and DELETE (session termination). Stateful mode issues Mcp-Session-Id after
+    # initialize; clients must echo it on subsequent requests.
+    session_manager = StreamableHTTPSessionManager(
+        app=mcp,
+        stateless=False,
+        json_response=False,
+    )
+
+    class _MCPStreamableApp:
+        # Same callable-class trick as _MCPSseApp — bypasses Starlette's
+        # request_response() wrapping so we get raw ASGI scope/receive/send.
+        async def __call__(self, scope, receive, send):
+            await session_manager.handle_request(scope, receive, send)
+
+    app.routes.append(Route(f"{base}", endpoint=_MCPStreamableApp()))
+
     # ── schema endpoint ───────────────────────────────────────
     @app.get(f"{base}/schema")
     async def _schema_endpoint():
@@ -304,6 +330,8 @@ def attach_mcp(
             "resources": [x.model_dump() for x in await _list_resources()],
             "resource_templates": [x.model_dump() for x in await _list_templates()],
         })
+
+    return session_manager
 
 
 # ── helpers ────────────────────────────────────────────────────
