@@ -65,6 +65,7 @@ from fastapi.staticfiles import StaticFiles
 from job import init_job_router
 
 from mcp_bridge import attach_mcp, mcp_resource, mcp_template, mcp_tool
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 import ast
 import crawl4ai as _c4
@@ -165,6 +166,9 @@ AsyncWebCrawler.arun = capped_arun
 
 # ───────────────────── FastAPI lifespan ──────────────────────
 
+# Forward declaration; assigned when attach_mcp() is called at module bottom.
+_session_manager: "StreamableHTTPSessionManager | None" = None
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -206,7 +210,9 @@ async def lifespan(_: FastAPI):
     app.state.janitor = asyncio.create_task(janitor())
     app.state.timeline_updater = asyncio.create_task(_timeline_updater())
 
-    yield
+    # StreamableHTTPSessionManager.run() must wrap yield; only one start per instance.
+    async with _session_manager.run():
+        yield
 
     # Cleanup
     app.state.janitor.cancel()
@@ -1118,7 +1124,7 @@ async def get_context(
 
 # attach MCP layer (adds /mcp/ws, /mcp/sse, /mcp/schema)
 print(f"MCP server running on {config['app']['host']}:{config['app']['port']}")
-attach_mcp(
+_session_manager = attach_mcp(
     app,
     # Internal MCP tool calls go over loopback to our own gated endpoints,
     # carrying a service token. Pin to 127.0.0.1 (config host may be 0.0.0.0,

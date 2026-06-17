@@ -814,6 +814,13 @@ class LXMLWebScrapingStrategy(ContentScrapingStrategy):
                                 parent.text = tail
                     parent.remove(element)  # Delete the element
 
+            # NOTE: Some sites (e.g., Baidu homepage) embed CSS/JS inside <textarea> elements
+            # as text content (e.g., <textarea id="s_is_result_css">&lt;style&gt;...&lt;/style&gt;</textarea>),
+            # which JavaScript later extracts and injects into the page. The above xpath-based
+            # removal won't catch these because they are text nodes, not actual <style>/<script> elements.
+            # If needed, add a pass here to remove <textarea> elements whose text_content()
+            # starts with "<style" or "<script". Tested: only Baidu homepage uses this pattern;
+            # Baidu search results and other search engines (Bing, Google, Sogou, Yahoo) do not.
 
             # Handle social media and domain exclusions
             kwargs["exclude_domains"] = set(kwargs.get("exclude_domains", []))
