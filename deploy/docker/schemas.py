@@ -74,9 +74,6 @@ class MarkdownRequest(BaseModel):
     # vector. The endpoint is derived server-side from the provider name.
 
 
-class RawCode(BaseModel):
-    code: str
-
 class HTMLRequest(BaseModel):
     url: str
     

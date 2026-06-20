@@ -28,7 +28,6 @@ from typing import Dict, Optional
 import jwt
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, EmailStr
-
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 ALGORITHM = "HS256"
 _ALGORITHMS = [ALGORITHM]  # a LIST on purpose: no substring matching, no alg:none

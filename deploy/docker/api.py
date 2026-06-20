@@ -25,7 +25,7 @@ from crawl4ai import (
     RateLimiter, 
     LLMConfig
 )
-from crawl4ai.async_configs import Provenance, UntrustedConfigError
+from crawl4ai.async_configs import UntrustedConfigError, _filter_untrusted_fields
 from hook_registry import build_declarative_hooks, HookValidationError
 from llm_broker import LLMProviderNotAllowed
 from crawl4ai.utils import perform_completion_with_backoff
@@ -677,15 +677,25 @@ async def handle_crawl_request(
 
     try:
         urls = _normalize_and_validate_seeds(urls)
+        # config.yml is fully trusted, only screen user params through untrusted gate
+        _browser_user = browser_config or {}
+        try:
+            _browser_user = _filter_untrusted_fields("BrowserConfig", _browser_user)
+        except UntrustedConfigError as e:
+            raise HTTPException(400, f"Rejected request: {e}")
         browser_config = BrowserConfig.load(
-            _deep_merge(get_browser_config_dict(config), browser_config or {}),
-            provenance=Provenance.UNTRUSTED,
+            _deep_merge(get_browser_config_dict(config), _browser_user)
         )
         # Non-streaming handler: force stream=False so arun_many() returns
         # List instead of AsyncGenerator, regardless of config.yml or user input.
-        merged_run = _deep_merge(get_run_config_dict(config), crawler_config or {})
+        _run_user = crawler_config or {}
+        try:
+            _run_user = _filter_untrusted_fields("CrawlerRunConfig", _run_user)
+        except UntrustedConfigError as e:
+            raise HTTPException(400, f"Rejected request: {e}")
+        merged_run = _deep_merge(get_run_config_dict(config), _run_user)
         merged_run["stream"] = False
-        crawler_config = CrawlerRunConfig.load(merged_run, provenance=Provenance.UNTRUSTED)
+        crawler_config = CrawlerRunConfig.load(merged_run)
         from egress_broker import enforce_egress
         enforce_egress(browser_config)
         from governor import clamp_deep_crawl
@@ -715,9 +725,14 @@ async def handle_crawl_request(
         if crawler_configs and len(urls) > 1:
             config_list = []
             for cc in crawler_configs:
-                merged = _deep_merge(get_run_config_dict(config), cc or {})
+                _run_user = cc or {}
+                try:
+                    _run_user = _filter_untrusted_fields("CrawlerRunConfig", _run_user)
+                except UntrustedConfigError as e:
+                    raise HTTPException(400, f"Rejected request: {e}")
+                merged = _deep_merge(get_run_config_dict(config), _run_user)
                 merged["stream"] = False
-                config_list.append(CrawlerRunConfig.load(merged, provenance=Provenance.UNTRUSTED))
+                config_list.append(CrawlerRunConfig.load(merged))
             effective_config = config_list
         else:
             effective_config = crawler_config
@@ -871,9 +886,14 @@ async def handle_stream_crawl_request(
         # mirroring handle_crawl_request. The streaming path previously skipped
         # this, leaving /crawl/stream (and /crawl with stream=true) unguarded.
         urls = _normalize_and_validate_seeds(urls)
+        # config.yml is fully trusted, only screen user params through untrusted gate
+        _browser_user = browser_config or {}
+        try:
+            _browser_user = _filter_untrusted_fields("BrowserConfig", _browser_user)
+        except UntrustedConfigError as e:
+            raise HTTPException(400, f"Rejected request: {e}")
         browser_config = BrowserConfig.load(
-            _deep_merge(get_browser_config_dict(config), browser_config or {}),
-            provenance=Provenance.UNTRUSTED,
+            _deep_merge(get_browser_config_dict(config), _browser_user)
         )
         browser_config.verbose = False
         from egress_broker import enforce_egress
@@ -883,9 +903,13 @@ async def handle_stream_crawl_request(
             "stream": True,
         }
         merged_run = _deep_merge(get_run_config_dict(config), endpoint_overrides)
+        _run_user = crawler_config or {}
+        try:
+            _run_user = _filter_untrusted_fields("CrawlerRunConfig", _run_user)
+        except UntrustedConfigError as e:
+            raise HTTPException(400, f"Rejected request: {e}")
         crawler_config = CrawlerRunConfig.load(
-            _deep_merge(merged_run, crawler_config or {}),
-            provenance=Provenance.UNTRUSTED,
+            _deep_merge(merged_run, _run_user)
         )
         from governor import clamp_deep_crawl
         clamp_deep_crawl(crawler_config)

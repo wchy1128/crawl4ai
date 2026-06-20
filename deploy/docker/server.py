@@ -9,7 +9,7 @@ Crawl4AI FastAPI entry‑point
 # ── stdlib & 3rd‑party imports ───────────────────────────────
 from crawler_pool import get_crawler, release_crawler, close_all, janitor
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
-from crawl4ai.async_configs import Provenance, UntrustedConfigError
+from crawl4ai.async_configs import Provenance, UntrustedConfigError, _filter_untrusted_fields
 from crawl4ai.__version__ import __version__
 from auth import (
     create_access_token, get_token_dependency, TokenRequest,
@@ -32,7 +32,6 @@ from api import (
 from schemas import (
     CrawlRequestWithHooks,
     MarkdownRequest,
-    RawCode,
     HTMLRequest,
     ScreenshotRequest,
     PDFRequest,
@@ -68,7 +67,6 @@ from mcp_bridge import attach_mcp, mcp_resource, mcp_template, mcp_tool
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 import ast
-import crawl4ai as _c4
 from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -121,16 +119,6 @@ def _browser_extra_args() -> list:
     return args
 
 
-def get_default_browser_config_dict() -> dict:
-    """Return the browser config dict from config.yml for use as a base layer."""
-    return get_browser_config_dict(config)
-
-
-def get_default_run_config_dict() -> dict:
-    """Return the run config dict from config.yml for use as a base layer."""
-    return get_run_config_dict(config)
-
-
 def get_default_browser_config() -> BrowserConfig:
     """Get default BrowserConfig from config.yml.
 
@@ -143,6 +131,16 @@ def get_default_browser_config() -> BrowserConfig:
     from egress_broker import enforce_egress
     enforce_egress(bc)
     return bc
+
+
+def get_default_browser_config_dict() -> dict:
+    """Return the browser config dict from config.yml for use as a base layer."""
+    return get_browser_config_dict(config)
+
+
+def get_default_run_config_dict() -> dict:
+    """Return the run config dict from config.yml for use as a base layer."""
+    return get_run_config_dict(config)
 
 # import logging
 # page_log = logging.getLogger("page_cap")
@@ -416,10 +414,13 @@ def _current_api_token() -> str:
     )
 
 
+_security_enabled = config.get("security", {}).get("enabled", False)
+
 app.add_middleware(
     AuthGateMiddleware,
     token_provider=_current_api_token,
     public_paths={HEALTH_PATH, "/token"},
+    disabled=not _security_enabled,
 )
 
 # ── request body-size limit (DoS) ─────────────────────────────────────
@@ -431,10 +432,15 @@ def _resolve_auth():
     """Runtime auth-posture guard. Runs at startup (lifespan), not import, so
     the behavioral test harness can import the app without a hard exit.
 
+    - security disabled       -> pass-through, no auth enforcement
     - credential configured  -> enforce (fail fast on jwt_enabled w/o SECRET_KEY)
     - none + non-loopback bind -> refuse to start (would be open to the network)
     - none + loopback bind    -> generate a one-off token and print it
     """
+    if not _security_enabled:
+        logger.info("Auth gate is pass-through (security.enabled=false).")
+        return
+
     host = config["app"]["host"]
     loopback = host in ("127.0.0.1", "localhost", "::1")
     api_token = _current_api_token()
@@ -504,6 +510,17 @@ def _config_from_json(data: dict) -> dict:
     return obj.dump()
 
 
+@app.post("/config/dump")
+async def config_dump(
+    data: dict,
+    _td: Dict = Depends(token_dep),
+):
+    try:
+        return JSONResponse(_config_from_json(data))
+    except (TypeError, ValueError) as e:
+        raise HTTPException(400, str(e))
+
+
 # ── job router ──────────────────────────────────────────────
 app.include_router(init_job_router(redis, config, token_dep))
 
@@ -569,17 +586,6 @@ async def get_token(req: TokenRequest):
         raise HTTPException(400, "Invalid email domain")
     token = create_access_token({"sub": req.email})
     return {"email": req.email, "access_token": token, "token_type": "bearer"}
-
-
-@app.post("/config/dump")
-async def config_dump(
-    data: dict,
-    _td: Dict = Depends(token_dep),
-):
-    try:
-        return JSONResponse(_config_from_json(data))
-    except (TypeError, ValueError) as e:
-        raise HTTPException(400, str(e))
 
 
 @app.post("/md")
@@ -914,12 +920,16 @@ async def crawl(
     if crawl_request.hooks and not HOOKS_ENABLED:
         raise HTTPException(403, "Hooks are disabled. Set CRAWL4AI_HOOKS_ENABLED=true to enable.")
     # Check whether it is a redirection for a streaming request.
-    # Merge with server defaults (e.g. stream: true from config.yml) before checking.
-    merged_run = _deep_merge(get_default_run_config_dict(), crawl_request.crawler_config or {})
+    # Merge with server defaults (config.yml is fully trusted, API params screened).
+    _server_defaults = get_default_run_config_dict()
+    _user_params = crawl_request.crawler_config or {}
+    # Only check user params for forbidden power-fields (server defaults bypass the gate)
     try:
-        crawler_config = CrawlerRunConfig.load(merged_run, provenance=Provenance.UNTRUSTED)
+        _user_params = _filter_untrusted_fields("CrawlerRunConfig", _user_params)
     except UntrustedConfigError as e:
         raise HTTPException(400, f"Rejected config: {e}")
+    merged_run = _deep_merge(_server_defaults, _user_params)
+    crawler_config = CrawlerRunConfig.load(merged_run)
     if crawler_config.stream:
         return await stream_process(crawl_request=crawl_request)
     

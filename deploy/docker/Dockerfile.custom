@@ -14,6 +14,19 @@ FROM ${BASE_IMAGE}
 
 USER root
 
+# Switch apt to Aliyun mirror for faster installs in China
+# Debian 12 (bookworm) slim uses deb822 format (debian.sources) by default; also handle legacy sources.list
+RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources; \
+    fi && \
+    if [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list; \
+    fi
+
+# Switch pip to Aliyun mirror for faster installs in China
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
+    pip config set global.trusted-host mirrors.aliyun.com
+
 # Install ss (iproute2), socat for network debugging, x11vnc for remote browser access
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 socat x11vnc \
     && rm -rf /var/lib/apt/lists/*
@@ -32,6 +45,35 @@ RUN echo ">>>>>>>>>> Patch commit(s):" && \
 # 3. Reinstall the crawl4ai library
 RUN pip install --no-cache-dir /tmp/crawl4ai && \
     python -c "import crawl4ai; print('crawl4ai library OK')"
+
+# 3.1 Purge the deprecated `jwt` package (zheli). It collides with the standard
+# `PyJWT` over the `jwt/` module namespace -- only one can survive and auth.py
+# requires PyJWT's API. Pip may leave stale `jwt/` files behind if both were
+# ever installed, so force-uninstall both then reinstall PyJWT cleanly.
+RUN pip uninstall -y jwt PyJWT || true && \
+    pip install --no-cache-dir "PyJWT==2.10.1" && \
+    python -c "import jwt; print('jwt module:', jwt.__file__); \
+                assert not hasattr(jwt, 'JWT'), 'legacy jwt package leaked into namespace'; \
+                print('jwt namespace = PyJWT OK')"
+
+# 3.2 Pin FastAPI below 0.137. Since FastAPI 0.137, include_router() appends a
+# single _IncludedRouter aggregator to app.routes instead of expanding the
+# sub-router's routes. prometheus-fastapi-instrumentator (shipped by the base
+# image) iterates app.routes and reads route.path, which raises
+#   AttributeError: '_IncludedRouter' object has no attribute 'path'
+# on every request and turns the whole API into HTTP 500. requirements.txt is
+# NOT consumed by this Dockerfile (deps come from the base image), so the pin
+# must live here. Drop this block once instrumentator>=8.0.0 lands in the base
+# image (upstream fix released 2026-05-29).
+# Explicit uninstall+install mirrors the PyJWT block above for consistency and
+# guarantees stale 0.137+ files are removed regardless of how the base image
+# installed fastapi (pip's auto-uninstall-on-downgrade normally suffices, but
+# being explicit is safer if dist-info/RECORD is ever inconsistent).
+RUN pip uninstall -y fastapi || true && \
+    pip install --no-cache-dir "fastapi<0.137" && \
+    python -c "import fastapi; v=tuple(int(x) for x in fastapi.__version__.split('.')[:3]); \
+               assert v < (0,137,0), 'fastapi pin failed: '+fastapi.__version__; \
+               print('fastapi', fastapi.__version__, 'OK (<0.137)')"
 
 # 3. Replace all server-side code (same as official: COPY deploy/docker/* /app/)
 RUN cp -r /tmp/crawl4ai/deploy/docker/* /app/ && \
