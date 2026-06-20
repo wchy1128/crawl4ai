@@ -40,15 +40,17 @@ class AuthGateMiddleware:
         token_provider: Callable[[], str],
         public_paths: Iterable[str] = (),
         public_prefixes: Iterable[str] = (),
+        disabled: bool = False,
     ):
         self.app = app
         self._token_provider = token_provider
         self.public_paths = set(public_paths)
         self.public_prefixes = tuple(public_prefixes)
+        self.disabled = disabled
 
     # ─────────────────────────── ASGI entry ───────────────────────────
     async def __call__(self, scope, receive, send):
-        if scope["type"] not in ("http", "websocket"):
+        if self.disabled or scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
             return
 
