@@ -51,6 +51,17 @@ _RESTART_DONE.set()
 # PERMANENT_STARTED_AT / restart deadline) so NTP jumps don't trick it.
 _LAST_HEALTH_PROBE_AT: float = 0.0
 
+# Strong refs to in-flight _restart_permanent tasks scheduled by
+# release_crawler (fire-and-forget). asyncio only holds weak refs to tasks,
+# so an unreferenced 30s+ restart task can be GC'd mid-flight. Adding the
+# task here on schedule + discarding on done keeps it alive until completion.
+_RESTART_TASKS: set = set()
+
+# Set by close_all() during shutdown. _restart_permanent checks this in
+# Phase 3 to skip rebuild — otherwise a restart racing shutdown would build
+# a fresh PERMANENT right after close_all() tore everything down.
+_CLOSING: bool = False
+
 
 def get_pool_snapshot() -> dict:
     """Return a point-in-time snapshot of pool state for monitoring.
@@ -106,6 +117,10 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
         await _RESTART_DONE.wait()
         # 轻量检查：断开（误关闭/崩溃）或库层在 AsyncWebCrawler 上打了
         # _browser_unhealthy 标记（renderer 卡死，is_connected() 查不出来）
+        # NOTE: 不 consume flag——让它持续直到 PERMANENT 被换新（重建后
+        # AsyncWebCrawler.__init__ 默认 _browser_unhealthy=False 自动重置）。
+        # 多个 caller 并发看到 flag=True 时都触发 _restart_permanent，
+        # 由 PERMANENT_RESTART_LOCK + _RESTART_DONE gate 去重成一次。
         _bm = PERMANENT.crawler_strategy.browser_manager if PERMANENT else None
         _bad = (
             _bm is None
@@ -114,8 +129,6 @@ async def get_crawler(cfg: BrowserConfig) -> AsyncWebCrawler:
             or getattr(PERMANENT, "_browser_unhealthy", False)
         )
         if _bad:
-            if PERMANENT is not None:
-                PERMANENT._browser_unhealthy = False  # consume the flag
             logger.info("🔌 Permanent browser unhealthy, triggering restart")
             await _restart_permanent(PERMANENT_CFG, trigger="unhealthy")
 
@@ -190,23 +203,64 @@ async def release_crawler(crawler: AsyncWebCrawler):
     obtained via get_crawler() so the janitor knows when it's safe
     to close idle browsers.
 
-    Also consumes the library-reported ``_browser_unhealthy`` flag (set by
+    Also inspects the library-reported ``_browser_unhealthy`` flag (set by
     AsyncWebCrawler after all retries fail and a probe confirms the browser
-    is hung). When set on the permanent crawler, schedules a restart
-    outside LOCK so the request path isn't blocked.
+    is hung) and reacts per pool tier:
+
+      - Permanent: schedule _restart_permanent (drain + rebuild).
+        Flag is NOT consumed here — it persists until PERMANENT is rebuilt
+        (new AsyncWebCrawler instance defaults _browser_unhealthy=False).
+        This closes the race where consume → schedule has a window in
+        which a new get_crawler caller grabs the still-hung browser.
+        Concurrent triggers are de-duped by PERMANENT_RESTART_LOCK.
+
+      - Hot/Cold pool: remove the bad crawler from its pool and close it.
+        No rebuild here — get_crawler will recreate on demand when the
+        same sig is requested again. Without this, a hung HOT/COLD
+        crawler would keep failing until the janitor's idle TTL kicks in.
+
+    The flag is intentionally left set on the (about-to-be-discarded)
+    crawler for hot/cold — it doesn't matter, the instance is dropped.
     """
     need_restart = bool(getattr(crawler, "_browser_unhealthy", False))
-    is_permanent = crawler is PERMANENT
 
     async with LOCK:
         if hasattr(crawler, 'active_requests'):
             crawler.active_requests = max(0, crawler.active_requests - 1)
-        if need_restart:
-            crawler._browser_unhealthy = False  # consume flag inside LOCK
 
-    if need_restart and is_permanent:
-        # Restart outside LOCK to avoid self-deadlock with _restart_permanent.
-        asyncio.create_task(_restart_permanent(PERMANENT_CFG, trigger="unhealthy"))
+    if not need_restart:
+        return
+
+    # Permanent path
+    if crawler is PERMANENT:
+        # Schedule restart outside LOCK to avoid self-deadlock. Save strong
+        # ref so the 30s+ task isn't GC'd mid-flight.
+        task = asyncio.create_task(_restart_permanent(PERMANENT_CFG, trigger="unhealthy"))
+        _RESTART_TASKS.add(task)
+        task.add_done_callback(_RESTART_TASKS.discard)
+        return
+
+    # Hot/Cold path: find and evict the bad crawler, then close it.
+    _bad_sig = None
+    async with LOCK:
+        for pool, name in ((HOT_POOL, "hot"), (COLD_POOL, "cold")):
+            for s, c in pool.items():
+                if c is crawler:
+                    _bad_sig = s
+                    break
+            if _bad_sig:
+                break
+        if _bad_sig:
+            # Evict while holding LOCK so a concurrent get_crawler can't
+            # grab the bad crawler between eviction and close.
+            HOT_POOL.pop(_bad_sig, None)
+            COLD_POOL.pop(_bad_sig, None)
+            LAST_USED.pop(_bad_sig, None)
+            USAGE_COUNT.pop(_bad_sig, None)
+            logger.info(f"🔌 Evicting unhealthy {name} pool crawler (sig={_bad_sig[:8]})")
+    if _bad_sig:
+        with suppress(Exception):
+            await crawler.close()
 
 def _build_permanent(cfg: BrowserConfig) -> AsyncWebCrawler:
     """Construct the permanent AsyncWebCrawler.
@@ -243,7 +297,8 @@ async def init_permanent(cfg: BrowserConfig):
 
 async def close_all():
     """Close all browsers."""
-    global PERMANENT, PERMANENT_CFG, PERMANENT_STARTED_AT
+    global PERMANENT, PERMANENT_CFG, PERMANENT_STARTED_AT, _CLOSING
+    _CLOSING = True  # tell any in-flight _restart_permanent to skip rebuild
     async with LOCK:
         tasks = []
         if PERMANENT:
@@ -304,6 +359,13 @@ async def _restart_permanent(cfg: BrowserConfig, trigger: str = "manual"):
     async with PERMANENT_RESTART_LOCK:
         # Re-check: if not set, a restart is already running — let that owner finish.
         if not _RESTART_DONE.is_set():
+            # If caller passed a fresh cfg (e.g. /restart_browser after
+            # editing config.yml), warn — it'll be silently dropped.
+            if cfg is not None and cfg is not PERMANENT_CFG:
+                logger.warning(
+                    f"🔄 restart({trigger}): another restart in progress, "
+                    f"provided cfg will be ignored"
+                )
             return
         _RESTART_DONE.clear()  # new default-config requests now hang in get_crawler
         logger.info(f"🔄 Restarting permanent browser (trigger={trigger})")
@@ -317,9 +379,10 @@ async def _restart_permanent(cfg: BrowserConfig, trigger: str = "manual"):
         if getattr(PERMANENT, "active_requests", 0) <= 0:
             break
         await asyncio.sleep(0.5)
-    if getattr(PERMANENT, "active_requests", 0) > 0:
+    _still_active = getattr(PERMANENT, "active_requests", 0)
+    if _still_active > 0:
         logger.warning(
-            f"🔄 Drain timed out with {PERMANENT.active_requests} active request(s) "
+            f"🔄 Drain timed out with {_still_active} active request(s) "
             f"— forcing restart (in-flight requests will fail)"
         )
 
@@ -328,6 +391,11 @@ async def _restart_permanent(cfg: BrowserConfig, trigger: str = "manual"):
     # requests would hang forever on get_crawler's gate.
     async with LOCK:
         try:
+            # If close_all() raced ahead and tore down the pool, don't rebuild
+            # — that would violate close_all's "shut everything down" semantic.
+            if _CLOSING:
+                logger.info("🔄 Skipping rebuild — pool is shutting down")
+                return
             if PERMANENT:
                 with suppress(Exception):
                     await PERMANENT.close()
