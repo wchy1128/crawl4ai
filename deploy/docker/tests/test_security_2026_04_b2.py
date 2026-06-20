@@ -64,42 +64,47 @@ class TestJWTSecretHardened(unittest.TestCase):
 # ============================================================================
 
 class TestConfigDumpNoEval(unittest.TestCase):
-    """Verify eval() is completely removed from the /config/dump path."""
+    """Verify eval() is completely removed from the config path.
+
+    Note: /config/dump endpoint was removed entirely (CVSS 9.1 RCE root cause).
+    The Playground now sends JSON dicts directly to /crawl, which validates via
+    BrowserConfig.load()/CrawlerRunConfig.load() with ALLOWED_DESERIALIZE_TYPES.
+    These tests assert that the dangerous eval machinery does not return.
+    """
+
+    def test_no_config_dump_endpoint(self):
+        """/config/dump endpoint must be removed (RCE root cause)."""
+        with open(os.path.join(DEPLOY_DIR, "server.py")) as f:
+            source = f.read()
+        self.assertNotIn("/config/dump", source,
+            "/config/dump endpoint must be deleted entirely")
+        self.assertNotIn("def config_dump", source,
+            "config_dump function must be deleted entirely")
 
     def test_no_safe_eval_config(self):
-        """_safe_eval_config function must be removed from server.py."""
+        """_safe_eval_config function must not exist in server.py."""
         with open(os.path.join(DEPLOY_DIR, "server.py")) as f:
             source = f.read()
         self.assertNotIn("def _safe_eval_config", source,
-            "_safe_eval_config must be deleted (replaced with JSON input)")
+            "_safe_eval_config must be deleted (was the eval RCE)")
 
-    def test_config_from_json_exists(self):
-        """_config_from_json function must exist."""
+    def test_no_eval_allowlist_constants(self):
+        """Old AST allowlist constants must be gone (enablers for eval)."""
         with open(os.path.join(DEPLOY_DIR, "server.py")) as f:
             source = f.read()
-        self.assertIn("def _config_from_json", source,
-            "_config_from_json must replace _safe_eval_config")
-
-    def test_config_dump_has_auth(self):
-        """config_dump endpoint must require authentication."""
-        with open(os.path.join(DEPLOY_DIR, "server.py")) as f:
-            source = f.read()
-        # Find the config_dump function and check it has token_dep
-        idx = source.index("config_dump")
-        # Look backwards for the decorator/function definition area
-        nearby = source[max(0, idx-200):idx+200]
-        self.assertIn("token_dep", nearby,
-            "/config/dump must require token_dep authentication")
-
-    def test_no_eval_in_config_path(self):
-        """No eval() call should exist in the config dump code path."""
-        with open(os.path.join(DEPLOY_DIR, "server.py")) as f:
-            source = f.read()
-        # The old allowlist constants should be gone
         self.assertNotIn("_SAFE_CONFIG_ALLOWED_NAMES", source,
             "Old eval allowlist constants should be removed")
         self.assertNotIn("_SAFE_CONFIG_ALLOWED_ATTRS", source,
             "Old eval allowlist constants should be removed")
+        self.assertNotIn("ALLOWED_TYPES", source,
+            "Old ALLOWED_TYPES config-dump helper constant should be removed")
+
+    def test_no_raw_code_schema(self):
+        """RawCode schema (used only by removed /config/dump) must be gone."""
+        with open(os.path.join(DEPLOY_DIR, "schemas.py")) as f:
+            source = f.read()
+        self.assertNotIn("class RawCode", source,
+            "RawCode schema must be deleted (no longer used)")
 
 
 # ============================================================================

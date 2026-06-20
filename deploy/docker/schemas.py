@@ -72,9 +72,6 @@ class MarkdownRequest(BaseModel):
     base_url: Optional[str] = Field(None, description="LLM API base URL override")
 
 
-class RawCode(BaseModel):
-    code: str
-
 class HTMLRequest(BaseModel):
     url: str
     

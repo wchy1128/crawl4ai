@@ -33,10 +33,10 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/clipboard.js/2.0.11/clipboard.min.js"></script>
-    <!-- CodeMirror (python mode) -->
+    <!-- CodeMirror (json mode) -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/matchbrackets.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/selection/active-line.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/darcula.min.css">
@@ -619,7 +619,7 @@
 
         // ================ ADVANCED CONFIG EDITOR ================
         const cmOpts = {
-            mode: 'python',
+            mode: { name: 'javascript', json: true },
             lineNumbers: true,
             theme: 'darcula',
             tabSize: 4,
@@ -630,21 +630,21 @@
         };
 
         const cmBC = CodeMirror(document.getElementById('bc-editor'), {
-            value: `BrowserConfig(
-    headless=True,
-    extra_args=[
+            value: `{
+    "headless": true,
+    "extra_args": [
         "--no-sandbox",
-        "--disable-gpu",
-    ],
-)`,
+        "--disable-gpu"
+    ]
+}`,
             ...cmOpts,
         });
 
         const cmCC = CodeMirror(document.getElementById('cc-editor'), {
-            value: `CrawlerRunConfig(
-    stream=True,
-    cache_mode=CacheMode.BYPASS,
-)`,
+            value: `{
+    "stream": true,
+    "cache_mode": "bypass"
+}`,
             ...cmOpts,
         });
         
@@ -682,27 +682,48 @@
             }
         });
 
+        // Known enum fields and their enum class names (matches backend
+        // ALLOWED_DESERIALIZE_TYPES whitelist). Users write the enum value as a
+        // flat string (e.g. "cache_mode": "bypass"); this converts it to the
+        // {type, params} form that CrawlerRunConfig.load()/BrowserConfig.load()
+        // can deserialize into a real enum object on the /crawl endpoint.
+        const ENUM_FIELDS = { cache_mode: 'CacheMode', match_mode: 'MatchMode' };
+        function normalizeEnums(obj) {
+            const out = { ...obj };
+            for (const [k, cls] of Object.entries(ENUM_FIELDS)) {
+                if (k in out && typeof out[k] === 'string') {
+                    out[k] = { type: cls, params: out[k].toLowerCase() };
+                }
+            }
+            return out;
+        }
+
+        // Parse the editor content as JSON locally. The /config/dump endpoint
+        // (which used eval() and was an RCE vector, CVSS 9.1) has been removed;
+        // the Playground now sends the parsed dict directly to /crawl, which
+        // validates it via BrowserConfig.load()/CrawlerRunConfig.load().
         async function parseConfig(editor, statusId) {
             const code = editor.getValue().trim();
             if (!code) return {};
             const statusEl = document.getElementById(statusId);
 
-            const res = await fetch('/config/dump', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ code }),
-            });
-
-            if (!res.ok) {
-                const msg = await res.text();
-                statusEl.textContent = '✖ error';
+            let parsed;
+            try {
+                parsed = JSON.parse(code);
+            } catch (e) {
+                statusEl.textContent = '✖ invalid JSON';
                 statusEl.className = 'text-xs text-red-400';
-                throw new Error(msg || 'Invalid config');
+                throw new Error('Invalid JSON: ' + e.message);
+            }
+            if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+                statusEl.textContent = '✖ not a JSON object';
+                statusEl.className = 'text-xs text-red-400';
+                throw new Error('Config must be a JSON object');
             }
 
             statusEl.textContent = '✓ parsed';
             statusEl.className = 'text-xs text-green-400';
-            return await res.json();
+            return normalizeEnums(parsed);
         }
 
         async function parseBothConfigs() {
@@ -791,7 +812,7 @@
         async function runCrawl() {
             const endpoint = document.getElementById('endpoint').value;
             const urls = document.getElementById('urls').value.trim().split(/\n/).filter(u => u);
-            // 1) parse both editors via /config/dump
+            // 1) parse both editors locally as JSON (no /config/dump call)
             let advConfig = {};
             try {
                 const parsed = await parseBothConfigs();
@@ -800,7 +821,7 @@
                 }
             } catch (err) {
                 const ccText = cmCC.getValue();
-                const streamFlag = /stream\s*=\s*True/i.test(ccText);
+                const streamFlag = /["']stream["']\s*:\s*true/i.test(ccText);
                 const isCrawlEndpoint = document.getElementById('endpoint').value === 'crawl';
                 if (isCrawlEndpoint && streamFlag) {
                     advConfig = { browser_config: {}, crawler_config: { stream: true } };
