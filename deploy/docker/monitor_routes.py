@@ -261,26 +261,25 @@ async def restart_browser(req: KillBrowserRequest):
         sig: Browser config signature (first 8 chars), or "permanent"
     """
     try:
-        from crawler_pool import (PERMANENT, HOT_POOL, COLD_POOL, LAST_USED,
-                                  USAGE_COUNT, LOCK, DEFAULT_CONFIG_SIG, init_permanent)
+        from crawler_pool import (HOT_POOL, COLD_POOL, LAST_USED,
+                                  USAGE_COUNT, LOCK, DEFAULT_CONFIG_SIG,
+                                  init_permanent, reset_permanent)
         from crawl4ai import AsyncWebCrawler, BrowserConfig
         from contextlib import suppress
         import time
 
         # Handle permanent browser restart
         if req.sig == "permanent" or (DEFAULT_CONFIG_SIG and DEFAULT_CONFIG_SIG.startswith(req.sig)):
-            async with LOCK:
-                if PERMANENT:
-                    with suppress(Exception):
-                        await PERMANENT.close()
-
-                # Reinitialize permanent
-                from utils import load_config
-                config = load_config()
-                await init_permanent(BrowserConfig(
-                    extra_args=config["crawler"]["browser"].get("extra_args", []),
-                    **config["crawler"]["browser"].get("kwargs", {}),
-                ))
+            # reset_permanent closes the old browser, nulls the global, and
+            # re-creates via init_permanent. Importing PERMANENT by value
+            # would snapshot a stale reference; reset_permanent operates on
+            # the module global directly.
+            from utils import load_config
+            config = load_config()
+            await reset_permanent(BrowserConfig(
+                extra_args=config["crawler"]["browser"].get("extra_args", []),
+                **config["crawler"]["browser"].get("kwargs", {}),
+            ))
 
             logger.info("🔄 Restarted permanent browser")
             return {"success": True, "restarted": "permanent"}

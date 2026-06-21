@@ -85,6 +85,7 @@ def _enforce_proxy_safety(browser_config, crawler_config=None):
         # opaque: do not echo the resolved internal address
         raise HTTPException(status_code=400, detail="Proxy destination blocked (SSRF protection)")
 
+
 # --- Helper to get memory ---
 def _get_memory_mb():
     try:
@@ -608,6 +609,16 @@ async def handle_crawl_request(
         browser_config = BrowserConfig.load(
             _deep_merge(get_browser_config_dict(config), browser_config or {})
         )
+        # Headless crawlers must NOT share the (headed) permanent browser's
+        # user_data_dir — a hung headed renderer corrupts GPUCache/ShaderCache
+        # in that dir, which then bricks every headless crawl that reuses it
+        # (Chrome hangs loading the bad cache, CDP never ready). Dropping
+        # user_data_dir lets headless use a per-instance temp profile that is
+        # deleted on browser close (ManagedBrowser.cleanup), so there is no
+        # cross-request pollution at all. Headless crawls rarely need login
+        # state; use the headed permanent path for sites that do.
+        if browser_config.headless:
+            browser_config.user_data_dir = None
         # Non-streaming handler: force stream=False so arun_many() returns
         # List instead of AsyncGenerator, regardless of config.yml or user input.
         merged_run = _deep_merge(get_run_config_dict(config), crawler_config or {})
@@ -797,6 +808,10 @@ async def handle_stream_crawl_request(
         merged_browser = _deep_merge(get_browser_config_dict(config), browser_config or {})
         # logger.info(f"[stream] browser_config verbose={merged_browser.get('verbose', 'NOT SET')}")
         browser_config = BrowserConfig.load(merged_browser)
+        # See handle_crawl_request: headless must not share the headed
+        # permanent browser's user_data_dir (renderer-hang pollution).
+        if browser_config.headless:
+            browser_config.user_data_dir = None
         # Streaming handler: force stream=True and scraping_strategy so
         # arun_many() returns AsyncGenerator, regardless of user input.
         merged_run = _deep_merge(get_run_config_dict(config), crawler_config or {})

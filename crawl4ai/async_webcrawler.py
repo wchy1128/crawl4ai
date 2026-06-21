@@ -169,9 +169,15 @@ class AsyncWebCrawler:
         # Decorate arun method with deep crawling capabilities
         self._deep_handler = DeepCrawlDecorator(self)
         self.arun = self._deep_handler(self.arun)
-        
+
         self.url_seeder: Optional[AsyncUrlSeeder] = None
         self._domain_mapper: Optional[DomainMapper] = None
+
+        # Browser-health flag set by arun() after all retries+proxies fail and
+        # a probe confirms the browser is hung. Read (and consume) by the
+        # deployment layer (crawler_pool.release_crawler) to trigger restart.
+        # Library users can also read crawl_result.crawl_stats["browser_unhealthy"].
+        self._browser_unhealthy: bool = False
 
     async def start(self):
         """
@@ -605,6 +611,33 @@ class AsyncWebCrawler:
 
                     # Restore original proxy_config
                     config.proxy_config = _original_proxy_config
+
+                    # --- All-retries-failed browser health check ---
+                    # 分层健康检查：部署层 get_crawler 每次爬取前做轻量 is_connected()
+                    # 检查（查不出 renderer 卡死），这里在所有代理+重试耗尽后用
+                    # _probe_browser_health 做复杂检查（goto about:blank + JS）。
+                    #
+                    # 反馈给部署层走两条路（由部署层 owner 读取，库层不戳
+                    # BrowserManager 内部状态、不主动 restart）：
+                    #   1) AsyncWebCrawler._browser_unhealthy = True
+                    #      部署层 crawler_pool.release_crawler 读到会触发 _restart_permanent
+                    #   2) crawl_stats["browser_unhealthy"] = True
+                    #      透传到 CrawlResult.crawl_stats，给最终调用方判断/告警用
+                    if not _done:
+                        _bm = getattr(self.crawler_strategy, "browser_manager", None)
+                        if (_bm is not None
+                                and getattr(_bm, "_probe_browser_health", None) is not None):
+                            try:
+                                _healthy = await _bm._probe_browser_health()
+                            except Exception:
+                                _healthy = False
+                            if not _healthy:
+                                self._browser_unhealthy = True
+                                _crawl_stats["browser_unhealthy"] = True
+                                self.logger.warning(
+                                    message="Browser health probe failed after all retries — marked for restart",
+                                    tag="BROWSER",
+                                )
 
                     # --- Fallback fetch function (last resort after all retries+proxies exhausted) ---
                     # Invoke fallback when: (a) crawl_result exists but is blocked, OR

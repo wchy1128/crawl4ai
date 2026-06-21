@@ -1,6 +1,7 @@
 import asyncio
 import time
 from typing import Dict, List, Optional, Tuple
+from contextlib import suppress
 import os
 import sys
 import shutil
@@ -96,7 +97,14 @@ class ManagedBrowser:
             flags.extend([
                 "--disable-gpu",
                 "--disable-gpu-compositing",
-                "--disable-software-rasterizer",
+                # 2026-06-20: --disable-software-rasterizer 注释掉。
+                # 原因：无 GPU 容器下此 flag 会关掉 SwiftShader 软件光栅化兜底，
+                # 导致 Chrome 在「零后端」状态下，特定页面会触发 renderer 卡死
+                # 并污染 profile（GPUCache/ShaderCache 写坏，后续所有复用该
+                # profile 的启动都卡在 CDP 初始化）。保留软件光栅化可显著降低
+                # 触发概率；卡死的兜底恢复由 _probe_browser_health + 缓存清理
+                # 负责。
+                # "--disable-software-rasterizer",
             ])
         if config.memory_saving_mode:
             flags.extend([
@@ -111,7 +119,8 @@ class ManagedBrowser:
                 "--disable-remote-fonts",
                 "--disable-images",
                 "--disable-javascript",
-                "--disable-software-rasterizer",
+                # 见 stealth 分支说明：text_mode 也保留 SwiftShader 兜底
+                # "--disable-software-rasterizer",
                 "--disable-dev-shm-usage",
             ])
         # proxy support — only pass server URL, never credentials.
@@ -236,6 +245,21 @@ class ManagedBrowser:
                     fp = os.path.join(self.user_data_dir, f)
                     if os.path.lexists(fp):
                         os.remove(fp)
+
+                # Clean potentially-polluted GPU cache directories before launch.
+                # A hung renderer can write half-formed data into GPUCache /
+                # ShaderCache / GrShaderCache, which then bricks every subsequent
+                # launch that reuses this profile (Chrome hangs loading the bad
+                # cache and CDP never becomes ready). These dirs are auto-rebuilt
+                # by Chromium; cookies / login state live under Default/ and are
+                # untouched. Only GPU-related dirs are cleared — HTTP/JS cache,
+                # Service Worker registration, and Sessions are unrelated to the
+                # renderer-hang corruption and clearing them has side effects
+                # (lost SW registrations, slower re-fetches).
+                for cache_dir in ("GPUCache", "ShaderCache", "GrShaderCache"):
+                    cp = os.path.join(self.user_data_dir, cache_dir)
+                    if os.path.isdir(cp):
+                        shutil.rmtree(cp, ignore_errors=True)
         except Exception as _e:
             # non-fatal — we'll try to start anyway, but log what happened
             self.logger.warning(f"pre-launch cleanup failed: {_e}", tag="BROWSER")            
@@ -247,15 +271,15 @@ class ManagedBrowser:
             # On Unix, we'll use preexec_fn=os.setpgrp to start the process in a new process group
             if sys.platform == "win32":
                 self.browser_process = subprocess.Popen(
-                    args, 
-                    stdout=subprocess.PIPE, 
+                    args,
+                    stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
                 )
             else:
                 self.browser_process = subprocess.Popen(
-                    args, 
-                    stdout=subprocess.PIPE, 
+                    args,
+                    stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     preexec_fn=os.setpgrp  # Start in a new process group
                 )
@@ -293,7 +317,7 @@ class ManagedBrowser:
                 stdout, stderr = self.browser_process.communicate(timeout=0.5)
             except subprocess.TimeoutExpired:
                 pass
-                
+
             self.logger.error(
                 message="Browser process terminated during startup | Code: {code} | STDOUT: {stdout} | STDERR: {stderr}",
                 tag="ERROR",
@@ -1074,7 +1098,7 @@ class BrowserManager:
         args = [
             "--disable-gpu",
             "--disable-gpu-compositing",
-            "--disable-software-rasterizer",
+            # "--disable-software-rasterizer",  # 见 build_browser_flags 说明（改动7）
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--no-first-run",
@@ -1114,7 +1138,8 @@ class BrowserManager:
                     "--disable-remote-fonts",
                     "--disable-images",
                     "--disable-javascript",
-                    "--disable-software-rasterizer",
+                    # 见 build_browser_flags stealth 分支说明：text_mode 也保留 SwiftShader 兜底
+                    # "--disable-software-rasterizer",
                     "--disable-dev-shm-usage",
                 ]
             )
@@ -1593,35 +1618,75 @@ class BrowserManager:
                 )
             return None
 
-    async def _ensure_browser_alive(self):
-        """检测 managed browser 是否存活，若已断开则重启。"""
-        if not self.config.use_managed_browser:
-            return
+    async def _probe_browser_health(self, timeout: float = 8.0) -> bool:
+        """Actively probe browser health by opening a throwaway page,
+        navigating to about:blank, and executing a tiny JS expression.
 
-        if self.browser is not None and self.browser.is_connected():
-            return
+        ``is_connected()`` reports True even when the renderer is hung (the
+        CDP WebSocket is still up, but no page can load). This probe covers
+        three layers that ``is_connected()`` misses:
 
-        if self.logger:
-            self.logger.info(
-                message="Managed browser disconnected, restarting...",
-                tag="BROWSER",
+        1. **Page creation** — ``new_page()`` forks a renderer process.
+        2. **Navigation** — ``goto(about:blank)`` exercises the CDP → renderer
+           IPC and the load-event pipeline.
+        3. **JS execution** — ``evaluate(Date.now())`` proves the V8 isolate is
+           alive and servicing the CDP command channel, not just forked.
+
+        The probe MUST use ``default_context`` (not an isolated BrowserContext)
+        because only that reflects the same context that in-flight crawl
+        requests are using. A per-renderer hang in ``default_context`` would
+        be missed by an isolated-context probe (the new context's renderer
+        would be freshly spawned and healthy).
+
+        All blocking calls are wrapped in ``asyncio.wait_for`` so a wedged
+        browser cannot trap the probe itself. The outer wait_for is the
+        ultimate backstop: even if some future code path inside the probe
+        forgets its own timeout, the whole thing is bounded.
+
+        Returns:
+            bool: True if the browser is healthy, False if hung or crashed.
+        """
+        if not self.browser or not self.browser.is_connected():
+            return False
+        if self.default_context is None:
+            return False
+
+        async def _run() -> bool:
+            # new_page() is a CDP command (Target.createTarget). On a wedged
+            # renderer it can hang just like goto — wrap it so the probe
+            # can't be trapped by the very browser it's trying to diagnose.
+            probe_page = await asyncio.wait_for(
+                self.default_context.new_page(), timeout=timeout
             )
+            try:
+                await probe_page.goto(
+                    "about:blank", wait_until="load", timeout=int(timeout * 1000)
+                )
+                await probe_page.evaluate("Date.now()")
+                return True
+            finally:
+                with suppress(Exception):
+                    await probe_page.close()
 
-        await self.close()
-
-        # close() 会把 managed_browser 设为 None，需要重建
-        if self.managed_browser is None:
-            self.managed_browser = ManagedBrowser(
-                browser_type=self.config.browser_type,
-                user_data_dir=self.config.user_data_dir,
-                headless=self.config.headless,
-                logger=self.logger,
-                debugging_port=self.config.debugging_port,
-                cdp_url=self.config.cdp_url,
-                browser_config=self.config,
-            )
-
-        await self.start()
+        try:
+            # Outer backstop: bound the entire probe to 1.5x timeout.
+            return await asyncio.wait_for(_run(), timeout=timeout * 1.5)
+        except asyncio.TimeoutError:
+            if self.logger:
+                self.logger.warning(
+                    message="Browser health probe TIMED OUT after {t}s — treating browser as dead",
+                    tag="BROWSER",
+                    params={"t": timeout},
+                )
+            return False
+        except Exception as e:
+            if self.logger:
+                self.logger.warning(
+                    message="Browser health probe FAILED: {err} — treating browser as dead",
+                    tag="BROWSER",
+                    params={"err": str(e)[:120]},
+                )
+            return False
 
     async def get_page(self, crawlerRunConfig: CrawlerRunConfig):
         """
@@ -1642,9 +1707,22 @@ class BrowserManager:
             self.sessions[crawlerRunConfig.session_id] = (context, page, time.time())
             return page, context
 
-        # If using a managed browser, just grab the shared default_context
+        # If using a managed browser, just grab the shared default_context.
+        # NOTE: 之前这里每次爬取前都调 _ensure_browser_alive()（含重型
+        # _probe_browser_health, 200ms~8s）自动诊断+重启，太重且与部署层
+        # _restart_permanent 的重启职责冲突（两层打架）。现改为分层健康检查：
+        #   - 部署层 get_crawler 每次爬取前做轻量 is_connected() 检查
+        #   - 库层在代理+重试全失败后才 _probe_browser_health 复杂检查
+        # 库层不再自动 restart，浏览器生命周期统一由部署层管理。
+        #
+        # 库用户直接用 AsyncWebCrawler 不走部署层时，遇到 renderer 卡死
+        # （is_connected() 仍 True 但页面无法加载）需要自己处理：
+        #   1) 监控 crawl_result.crawl_stats.browser_unhealthy 字段
+        #      （库层在所有重试+代理耗尽后会做 probe 并设置该字段）
+        #   2) 检测到 unhealthy 后自行决定是否 crawler.close() + 重建
+        # 库层不主动 restart 是有意设计——避免和上层（如 crawler_pool）的
+        # 生命周期管理冲突。
         if self.config.use_managed_browser:
-            await self._ensure_browser_alive()
             # If create_isolated_context is True, create isolated contexts for concurrent crawls
             # Uses the same caching mechanism as non-CDP mode: cache context by config signature,
             # but always create a new page. This prevents navigation conflicts while allowing
