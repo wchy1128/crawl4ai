@@ -525,8 +525,15 @@ async def config_dump(
 app.include_router(init_job_router(redis, config, token_dep))
 
 # ── monitor router ──────────────────────────────────────────
+# Auth for both HTTP and WebSocket routes is enforced by AuthGateMiddleware
+# (outermost ASGI layer). Do NOT attach dependencies=[Depends(token_dep)] here:
+# token_dep is _principal(request: Request) which has no `request` in a
+# WebSocket context, and FastAPI applies router-level dependencies to WebSocket
+# routes too — that combination crashes /monitor/ws with
+# "_principal() missing 1 required positional argument: 'request'".
+# Admin-only monitor actions declare their own Depends(require_admin).
 from monitor_routes import router as monitor_router
-app.include_router(monitor_router, dependencies=[Depends(token_dep)])
+app.include_router(monitor_router)
 
 logger = logging.getLogger(__name__)
 

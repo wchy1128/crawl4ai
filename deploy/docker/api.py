@@ -700,7 +700,6 @@ async def handle_crawl_request(
         enforce_egress(browser_config)
         from governor import clamp_deep_crawl
         clamp_deep_crawl(crawler_config)
-        _enforce_proxy_safety(browser_config, crawler_config)
 
         dispatcher = MemoryAdaptiveDispatcher(
             memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
@@ -895,7 +894,6 @@ async def handle_stream_crawl_request(
         browser_config = BrowserConfig.load(
             _deep_merge(get_browser_config_dict(config), _browser_user)
         )
-        browser_config.verbose = False
         from egress_broker import enforce_egress
         enforce_egress(browser_config)
         endpoint_overrides = {
@@ -913,7 +911,6 @@ async def handle_stream_crawl_request(
         )
         from governor import clamp_deep_crawl
         clamp_deep_crawl(crawler_config)
-        _enforce_proxy_safety(browser_config, crawler_config)
 
         # Deep crawl streaming supports exactly one start URL
         if crawler_config.deep_crawl_strategy is not None and len(urls) != 1:

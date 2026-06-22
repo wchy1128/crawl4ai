@@ -134,6 +134,12 @@ def get_token_dependency(config: Dict):
 
 def require_admin(request: Request) -> Dict:
     """Dependency: require an admin-scope principal (destructive actions)."""
+    # security.enabled=false 时 AuthGateMiddleware 是 pass-through，不会设置
+    # principal。此时整个系统本就无鉴权，admin 检查也应放行，否则 dev 模式下
+    # /monitor/actions/* 永远 403。
+    from utils import load_config
+    if not load_config().get("security", {}).get("enabled", False):
+        return {"sub": "operator", "scope": "admin", "via": "security_disabled"}
     principal = get_principal(request)
     if not principal or principal.get("scope") != "admin":
         raise HTTPException(status_code=403, detail="Admin scope required")

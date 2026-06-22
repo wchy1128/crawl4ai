@@ -58,7 +58,7 @@ rate_limiting:
 #   - Set SECRET_KEY environment variable to a secure random value
 #   - Set CRAWL4AI_HOOKS_ENABLED=true only if you need hooks (RCE risk)
 security:
-  enabled: true
+  enabled: false
   jwt_enabled: false
   api_token: ""  # When set, /token endpoint requires this secret to issue JWTs
   https_redirect: false
@@ -87,7 +87,7 @@ crawler:
   browser:
     use_undetected: true                   # 启用 Patchright 反检测引擎（绕 Cloudflare）
     kwargs:
-      use_managed_browser: false          # 持久化浏览器 profile，保留 cookie/登录态
+      use_persistent_context: true          # 持久化浏览器 profile，保留 cookie/登录态
       user_data_dir: ".\\profiles_tmp"  # 持久化浏览器用户数据目录
       headless: false
       text_mode: false

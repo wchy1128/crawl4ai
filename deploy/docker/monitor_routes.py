@@ -262,26 +262,20 @@ async def restart_browser(req: KillBrowserRequest):
         sig: Browser config signature (first 8 chars), or "permanent"
     """
     try:
-        from crawler_pool import (PERMANENT, HOT_POOL, COLD_POOL, LAST_USED,
-                                  USAGE_COUNT, LOCK, DEFAULT_CONFIG_SIG, init_permanent)
-        from crawl4ai import AsyncWebCrawler, BrowserConfig
+        import crawler_pool
         from contextlib import suppress
         import time
 
         # Handle permanent browser restart
-        if req.sig == "permanent" or (DEFAULT_CONFIG_SIG and DEFAULT_CONFIG_SIG.startswith(req.sig)):
-            async with LOCK:
-                if PERMANENT:
+        if req.sig == "permanent" or (crawler_pool.DEFAULT_CONFIG_SIG and crawler_pool.DEFAULT_CONFIG_SIG.startswith(req.sig)):
+            async with crawler_pool.LOCK:
+                if crawler_pool.PERMANENT:
                     with suppress(Exception):
-                        await PERMANENT.close()
+                        await crawler_pool.PERMANENT.close()
+                    crawler_pool.PERMANENT = None
 
-                # Reinitialize permanent
-                from utils import load_config
-                config = load_config()
-                await init_permanent(BrowserConfig(
-                    extra_args=config["crawler"]["browser"].get("extra_args", []),
-                    **config["crawler"]["browser"].get("kwargs", {}),
-                ))
+            from server import get_default_browser_config
+            await crawler_pool.init_permanent(get_default_browser_config())
 
             logger.info("🔄 Restarted permanent browser")
             return {"success": True, "restarted": "permanent"}
@@ -289,19 +283,16 @@ async def restart_browser(req: KillBrowserRequest):
         # Handle hot/cold browser restart
         target_sig = None
         pool_type = None
-        browser_config = None
 
-        async with LOCK:
-            # Find browser
-            for sig in HOT_POOL.keys():
+        async with crawler_pool.LOCK:
+            for sig in crawler_pool.HOT_POOL.keys():
                 if sig.startswith(req.sig):
                     target_sig = sig
                     pool_type = "hot"
-                    # Would need to reconstruct config (not stored currently)
                     break
 
             if not target_sig:
-                for sig in COLD_POOL.keys():
+                for sig in crawler_pool.COLD_POOL.keys():
                     if sig.startswith(req.sig):
                         target_sig = sig
                         pool_type = "cold"
@@ -310,19 +301,16 @@ async def restart_browser(req: KillBrowserRequest):
             if not target_sig:
                 raise HTTPException(404, f"Browser with sig={req.sig} not found")
 
-            # Kill existing
             if pool_type == "hot":
-                browser = HOT_POOL.pop(target_sig)
+                browser = crawler_pool.HOT_POOL.pop(target_sig)
             else:
-                browser = COLD_POOL.pop(target_sig)
+                browser = crawler_pool.COLD_POOL.pop(target_sig)
 
             with suppress(Exception):
                 await browser.close()
 
-            # Note: We can't easily recreate with same config without storing it
-            # For now, just kill and let new requests create fresh ones
-            LAST_USED.pop(target_sig, None)
-            USAGE_COUNT.pop(target_sig, None)
+            crawler_pool.LAST_USED.pop(target_sig, None)
+            crawler_pool.USAGE_COUNT.pop(target_sig, None)
 
         logger.info(f"🔄 Restarted {pool_type} browser (sig={target_sig[:8]})")
 
