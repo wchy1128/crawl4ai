@@ -36,7 +36,20 @@ RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
     pip config set global.trusted-host mirrors.aliyun.com
 
 # Install ss (iproute2), socat for network debugging, x11vnc for remote browser access
-RUN apt-get update && apt-get install -y --no-install-recommends iproute2 socat x11vnc \
+# + Mesa DRI/GLX/EGL 用户态驱动（容器需通过 /dev/dri 直通宿主 GPU 才有意义）：
+#   - libgl1-mesa-dri 提供 iris_dri.so（Intel Gen11+，含 TS-464C2 的 Jasper Lake UHD）
+#   - libglx-mesa0/libegl-mesa0 提供 GLX/EGL → Mesa 桥接
+#   - mesa-utils 提供 glxinfo，便于容器内验证（DISPLAY=:99 glxinfo | grep renderer）
+#
+# 故意不装的：intel-media-va-driver-non-free + libva2（VAAPI 视频硬解码）
+#   - neko/runtime/Dockerfile.intel 装这两个是为了 GStreamer 用 VAAPI 编码 WebRTC 推流。
+#   - 我们场景是抓 HTML / 截图，不播视频、不推流，VAAPI 用不上。
+#   - 边角情况：若以后启用 scan_full_page 滚动有 <video> 标签的反爬页（视频起播才解锁
+#     内容），VAAPI 能省解码 CPU。届时再加 `intel-media-va-driver-non-free libva2`。
+#     现在不加，避免镜像膨胀。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        iproute2 socat x11vnc \
+        libgl1-mesa-dri libglx-mesa0 libegl-mesa0 mesa-utils \
     && rm -rf /var/lib/apt/lists/*
 
 ARG GITHUB_REPO=https://github.com/wchy1128/crawl4ai.git
