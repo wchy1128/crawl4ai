@@ -218,22 +218,21 @@ async def lifespan(_: FastAPI):
     app.state.artifact_janitor = asyncio.create_task(_artifact_janitor())
 
     # Start the localhost pinning forward-proxy and route the browser through it.
-    from egress_proxy import PinningProxy
-    from egress_broker import set_egress_proxy
-    app.state.egress_proxy = PinningProxy()
-    _proxy_url = await app.state.egress_proxy.start()
-    set_egress_proxy(_proxy_url)
-
-    # Chromium is only one of the clients that fetch a caller-chosen URL. The
-    # library's own HTTP clients -- the URL seeder (link previews, sitemaps) and
-    # RobotsParser -- take a proxy kwarg, so point them at the same pinning
-    # proxy or those paths stay unguarded SSRF holes.
-    from crawl4ai.egress_policy import set_egress_proxy as set_library_egress_proxy
-    set_library_egress_proxy(_proxy_url)
-
-    # PDFContentScrapingStrategy fetches with requests, which has no proxy hook
-    # we can rely on here, so it gets the same destination policy by injection.
-    _install_pdf_egress_policy()
+    from egress_broker import DISABLE_EGRESS, set_egress_proxy
+    if not DISABLE_EGRESS:
+        from egress_proxy import PinningProxy
+        app.state.egress_proxy = PinningProxy()
+        _proxy_url = await app.state.egress_proxy.start()
+        set_egress_proxy(_proxy_url)
+        # Chromium is only one of the clients that fetch a caller-chosen URL. The
+        # library's own HTTP clients -- the URL seeder (link previews, sitemaps) and
+        # RobotsParser -- take a proxy kwarg, so point them at the same pinning
+        # proxy or those paths stay unguarded SSRF holes.
+        from crawl4ai.egress_policy import set_egress_proxy as set_library_egress_proxy
+        set_library_egress_proxy(_proxy_url)
+        # PDFContentScrapingStrategy fetches with requests, which has no proxy hook
+        # we can rely on here, so it gets the same destination policy by injection.
+        _install_pdf_egress_policy()
 
     # Bounded background-job queue (per-principal quotas optional).
     from work_queue import WorkQueue, set_job_queue
@@ -264,7 +263,8 @@ async def lifespan(_: FastAPI):
     app.state.timeline_updater.cancel()
     app.state.artifact_janitor.cancel()
     try:
-        await app.state.egress_proxy.stop()
+        if not DISABLE_EGRESS:
+            await app.state.egress_proxy.stop()
     except Exception:
         pass
     try:

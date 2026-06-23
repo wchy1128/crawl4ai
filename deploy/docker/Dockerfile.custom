@@ -14,6 +14,14 @@ FROM ${BASE_IMAGE}
 
 USER root
 
+# Build-time proxy (NOT persisted to image). Docker treats these as predefined
+# build args: when passed via --build-arg they're auto-exported as env vars to
+# all RUN commands during build, used by apt/pip/git/curl, then dropped from
+# the final image — no ENV, no docker history leak.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+
 # Switch apt to Aliyun mirror for faster installs in China
 # Debian 12 (bookworm) slim uses deb822 format (debian.sources) by default; also handle legacy sources.list
 RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
@@ -45,16 +53,6 @@ RUN echo ">>>>>>>>>> Patch commit(s):" && \
 # 3. Reinstall the crawl4ai library
 RUN pip install --no-cache-dir /tmp/crawl4ai && \
     python -c "import crawl4ai; print('crawl4ai library OK')"
-
-# 3.1 Purge the deprecated `jwt` package (zheli). It collides with the standard
-# `PyJWT` over the `jwt/` module namespace -- only one can survive and auth.py
-# requires PyJWT's API. Pip may leave stale `jwt/` files behind if both were
-# ever installed, so force-uninstall both then reinstall PyJWT cleanly.
-RUN pip uninstall -y jwt PyJWT || true && \
-    pip install --no-cache-dir "PyJWT==2.10.1" && \
-    python -c "import jwt; print('jwt module:', jwt.__file__); \
-                assert not hasattr(jwt, 'JWT'), 'legacy jwt package leaked into namespace'; \
-                print('jwt namespace = PyJWT OK')"
 
 # 3.2 Pin FastAPI below 0.137. Since FastAPI 0.137, include_router() appends a
 # single _IncludedRouter aggregator to app.routes instead of expanding the
