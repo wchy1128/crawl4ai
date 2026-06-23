@@ -34,4 +34,10 @@ else
 fi
 export GUNICORN_BIND
 
+# Remove stale Xvfb lock files left by a previous container crash / SIGKILL
+# so container restart won't bail with "Server is already active for display 99".
+for f in /tmp/.X*-lock /tmp/.X11-unix/X*; do
+    [ -f "$f" ] && rm -f "$f"
+done
+
 exec supervisord -c supervisord.conf

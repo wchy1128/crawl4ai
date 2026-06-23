@@ -183,10 +183,11 @@ async def lifespan(_: FastAPI):
     app.state.artifact_janitor = asyncio.create_task(_artifact_janitor())
 
     # Start the localhost pinning forward-proxy and route the browser through it.
-    from egress_proxy import PinningProxy
-    from egress_broker import set_egress_proxy
-    app.state.egress_proxy = PinningProxy()
-    set_egress_proxy(await app.state.egress_proxy.start())
+    from egress_broker import DISABLE_EGRESS, set_egress_proxy
+    if not DISABLE_EGRESS:
+        from egress_proxy import PinningProxy
+        app.state.egress_proxy = PinningProxy()
+        set_egress_proxy(await app.state.egress_proxy.start())
 
     # Bounded background-job queue (per-principal quotas optional).
     from work_queue import WorkQueue, set_job_queue
@@ -217,7 +218,8 @@ async def lifespan(_: FastAPI):
     app.state.timeline_updater.cancel()
     app.state.artifact_janitor.cancel()
     try:
-        await app.state.egress_proxy.stop()
+        if not DISABLE_EGRESS:
+            await app.state.egress_proxy.stop()
     except Exception:
         pass
     try:

@@ -222,7 +222,8 @@ UNTRUSTED_FORBIDDEN_FIELDS = {
 UNTRUSTED_FIELD_ALLOWLIST = {
     "BrowserConfig": {
         "browser_type", "headless", "browser_mode", "viewport_width",
-        "viewport_height", "viewport", "device_scale_factor", "accept_downloads",
+        "viewport_height", "viewport", "no_viewport",
+        "device_scale_factor", "accept_downloads",
         "java_script_enabled", "text_mode", "light_mode", "enable_stealth",
         "avoid_ads", "avoid_css", "user_agent", "user_agent_mode",
         "user_agent_generator_config", "verbose", "memory_saving_mode",
@@ -728,6 +729,13 @@ class BrowserConfig:
         viewport_height (int): Default viewport height for pages. Default: 600.
         viewport (dict): Default viewport dimensions for pages. If set, overrides viewport_width and viewport_height.
                          Default: None.
+        no_viewport (bool): If True, passes no_viewport=True to Playwright when creating a browser
+                         context, disabling forced viewport emulation. The page rendering area then follows
+                         the real OS window size — better for anti-bot evasion (innerWidth/screen/outerWidth
+                         stay consistent with the actual OS window). Note: calling `page.set_viewport_size()`
+                         later (e.g. when `CrawlerRunConfig.adjust_viewport_to_content=True` or via
+                         take_screenshot_scroller) will re-enable emulation as a Playwright API limitation.
+                         Default: False.
         device_scale_factor (float): The device pixel ratio used for rendering pages. Controls how many
                                      physical pixels map to one CSS pixel, allowing simulation of HiDPI
                                      or Retina displays. For example, a viewport of 1920x1080 with a
@@ -800,6 +808,7 @@ class BrowserConfig:
         viewport_width: int = 1080,
         viewport_height: int = 600,
         viewport: dict = None,
+        no_viewport: bool = False,
         device_scale_factor: float = 1.0,
         accept_downloads: bool = False,
         downloads_path: str = None,
@@ -868,6 +877,7 @@ class BrowserConfig:
 
         self.viewport_width = viewport_width
         self.viewport_height = viewport_height
+        self.no_viewport = no_viewport
         self.viewport = viewport
         if self.viewport is not None:
             self.viewport_width = self.viewport.get("width", 1080)
@@ -967,6 +977,7 @@ class BrowserConfig:
             "proxy_config": self.proxy_config.to_dict() if hasattr(self.proxy_config, 'to_dict') else self.proxy_config,
             "viewport_width": self.viewport_width,
             "viewport_height": self.viewport_height,
+            "no_viewport": self.no_viewport,
             "device_scale_factor": self.device_scale_factor,
             "accept_downloads": self.accept_downloads,
             "downloads_path": self.downloads_path,

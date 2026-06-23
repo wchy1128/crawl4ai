@@ -91,6 +91,9 @@ crawler:
       user_data_dir: ".\\profiles_tmp"  # 持久化浏览器用户数据目录
       headless: false
       text_mode: false
+      viewport_width: 1903                  # 略小于 Xvfb screen (1920)，模拟真实浏览器 chrome 边框 17px
+      viewport_height: 969                  # 略小于 Xvfb screen (1080)，模拟标题栏+地址栏 111px
+      no_viewport: true   # 关闭 Playwright 强制 viewport emulation，页面渲染区跟随 OS 窗口
       enable_stealth: false              # Patchright 已在二进制层处理，playwright-stealth 反而冲突
       # user_agent_mode: "random"        # 禁用：随机 UA 导致 Sec-Ch-Ua/UA 不一致（如 Edge UA + Chrome hint）
     extra_args:
@@ -111,7 +114,7 @@ crawler:
       # - "--ignore-certificate-errors"
       # - "--disable-software-rasterizer"
       - "--window-position=0,0"
-      - "--window-size=1920,1080"
+      - "--window-size=1903,969"
   run_config:
     stream: false
     simulate_user: true

@@ -34,6 +34,12 @@ from urllib.parse import urlparse
 # Operator escape hatch for trusted internal deployments (off by default).
 ALLOW_INTERNAL = os.environ.get("CRAWL4AI_ALLOW_INTERNAL_URLS", "false").lower() == "true"
 
+# Disable the egress pinning proxy entirely. When enabled, the browser uses
+# its own (or the operator-configured) proxy instead of being force-routed
+# through the localhost forward-proxy. Useful when the container must reach
+# the internet through an upstream proxy.
+DISABLE_EGRESS = os.environ.get("CRAWL4AI_DISABLE_EGRESS_PROXY", "false").lower() == "true"
+
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 _V4COMPAT = ipaddress.ip_network("::/96")
 _6TO4 = ipaddress.ip_network("2002::/16")
@@ -187,6 +193,8 @@ def enforce_egress(browser_config) -> None:
       - strip any proxy/TLS-weakening Chromium launch flags.
     """
     if browser_config is None:
+        return
+    if DISABLE_EGRESS:
         return
     if not ALLOW_INSECURE_TLS and hasattr(browser_config, "ignore_https_errors"):
         browser_config.ignore_https_errors = False

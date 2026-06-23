@@ -1,11 +1,12 @@
 import asyncio
+import json
 import time
 from typing import Dict, List, Optional, Tuple
 import os
 import sys
 import shutil
 import tempfile
-import psutil  
+import psutil
 import signal
 import subprocess
 import shlex
@@ -238,8 +239,7 @@ class ManagedBrowser:
                         os.remove(fp)
         except Exception as _e:
             # non-fatal — we'll try to start anyway, but log what happened
-            self.logger.warning(f"pre-launch cleanup failed: {_e}", tag="BROWSER")            
-            
+            self.logger.warning(f"pre-launch cleanup failed: {_e}", tag="BROWSER")
 
         # Start browser process
         try:
@@ -842,6 +842,7 @@ class BrowserManager:
                 "--user-data-dir",
                 "--headless",
                 "--window-size",
+                "--window-position",
             )
             cli_args = [
                 flag
@@ -854,14 +855,21 @@ class BrowserManager:
             launch_kwargs = {
                 "headless": self.config.headless,
                 "args": list(dict.fromkeys(cli_args)),  # dedupe
-                "viewport": {
-                    "width": self.config.viewport_width,
-                    "height": self.config.viewport_height,
-                },
                 "user_agent": self.config.user_agent or None,
                 "ignore_https_errors": self.config.ignore_https_errors,
                 "accept_downloads": self.config.accept_downloads,
             }
+            # no_viewport=True 关闭 Playwright 强制 emulation，页面渲染区跟随 OS 窗口
+            # （反爬：innerWidth/screen/outerWidth 等指标天然一致）。注意：之后任何
+            # page.set_viewport_size() 调用（如 adjust_viewport_to_content / scroller
+            # 截图）会重新开启 emulation，这是 Playwright API 限制。
+            if self.config.no_viewport:
+                launch_kwargs["no_viewport"] = True
+            else:
+                launch_kwargs["viewport"] = {
+                    "width": self.config.viewport_width,
+                    "height": self.config.viewport_height,
+                }
 
             if self.config.proxy_config:
                 launch_kwargs["proxy"] = {
@@ -1374,7 +1382,6 @@ class BrowserManager:
         # Common context settings
         context_settings = {
             "user_agent": user_agent,
-            "viewport": viewport_settings,
             "proxy": proxy_settings,
             "accept_downloads": self.config.accept_downloads,
             "storage_state": self.config.storage_state,
@@ -1382,6 +1389,10 @@ class BrowserManager:
             "device_scale_factor": self.config.device_scale_factor,
             "java_script_enabled": self.config.java_script_enabled,
         }
+        if self.config.no_viewport:
+            context_settings["no_viewport"] = True
+        else:
+            context_settings["viewport"] = viewport_settings
         
         if crawlerRunConfig:
             # Check if there is value for crawlerRunConfig.proxy_config set add that to context
