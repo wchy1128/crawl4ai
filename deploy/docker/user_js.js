@@ -1,12 +1,29 @@
-// ===== Cloudflare Challenge polling (all domains) =====
-// Polls until Cloudflare's interstitial disappears.
-// On normal pages: one DOM query, resolves instantly (zero impact).
+// ===== Cloudflare 挑战页等待器（对所有域名生效） =====
+// 每 500ms 查一次：CF 拦截元素是否还在 DOM 中。
+// 都不在 → 放行；存在 → 继续等，直到挑战通过或上层超时。
+// 正常页面零开销：一次 querySelector 立即 resolve。
+//
+// 覆盖的 CF 拦截形态：
+//   #challenge-form                                 — 旧版「Checking your browser…」5 秒盾
+//   .cf-browser-verification                        — 同上的 wrapper class
+//   #challenge-stage                                — 2024+ 新版 JS challenge 容器
+//   iframe[src*='challenges.cloudflare.com']        — Turnstile 验证码 iframe（stackoverflow 等用）
+//   #cf-chl-widget                                  — Turnstile widget 挂载点
+const CF_CHALLENGE_SELECTOR = [
+    "#challenge-form",
+    ".cf-browser-verification",
+    "#challenge-stage",
+    "iframe[src*='challenges.cloudflare.com']",
+    "#cf-chl-widget",
+].join(", ");
+
+// 最长等 25 秒，超时后放行（让上层拿到挑战页 HTML 自行判断/重试）。
+// 不 reject 而是 resolve：避免与 page_timeout(120s) 叠加浪费配额，也方便上层
+// 通过 <title>Just a moment...</title> 等特征识别 CF 挑战页。
 await new Promise((resolve) => {
+    const deadline = Date.now() + 25000;
     const poll = () => {
-        if (
-            !document.querySelector("#challenge-form") &&
-            !document.querySelector(".cf-browser-verification")
-        ) {
+        if (!document.querySelector(CF_CHALLENGE_SELECTOR) || Date.now() > deadline) {
             resolve();
         } else {
             setTimeout(poll, 500);

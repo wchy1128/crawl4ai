@@ -95,6 +95,7 @@ crawler:
       viewport_height: 969                  # 略小于 Xvfb screen (1080)，模拟标题栏+地址栏 111px
       no_viewport: true   # 关闭 Playwright 强制 viewport emulation，页面渲染区跟随 OS 窗口
       enable_stealth: false              # Patchright 已在二进制层处理，playwright-stealth 反而冲突
+      user_agent_mode: "browser_default" # 用 Chromium 原生 UA + Sec-CH-UA（升级浏览器自动跟新版本号，避免硬编码 Chrome 116 与 Patchright 真实版本不一致被 CF 识破）
       # user_agent_mode: "random"        # 禁用：随机 UA 导致 Sec-Ch-Ua/UA 不一致（如 Edge UA + Chrome hint）
     extra_args:
       # - "--single-process"
@@ -107,7 +108,7 @@ crawler:
       # Chromium still starts. Tracked as a build-gated hardening item.
       - "--no-sandbox"
       # - "--disable-dev-shm-usage"        # 映射了 /dev/shm:/dev/shm
-      - "--disable-gpu"
+      # - "--disable-gpu"
       # 去掉以下特征旗，Cloudflare 会检测它们
       # - "--disable-web-security"
       # - "--allow-insecure-localhost"
@@ -123,7 +124,7 @@ crawler:
     wait_until: "load"
     page_timeout: 120000
     process_iframes: false
-    magic: true
+    magic: false
     remove_overlay_elements: true
     remove_consent_popups: true
     delay_before_return_html: 1.0

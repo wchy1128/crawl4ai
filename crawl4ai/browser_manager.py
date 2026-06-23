@@ -68,7 +68,7 @@ class ManagedBrowser:
     """
     
     @staticmethod
-    def build_browser_flags(config: BrowserConfig) -> List[str]:
+    def build_browser_flags(config: BrowserConfig, use_undetected: bool = False) -> List[str]:
         """Common CLI flags for launching Chromium"""
         flags = [
             "--no-sandbox",
@@ -92,8 +92,10 @@ class ManagedBrowser:
             "--disable-domain-reliability",
         ]
         # GPU flags disable WebGL which anti-bot sensors detect as headless.
-        # Keep WebGL working (via SwiftShader) when stealth mode is active.
-        if not config.enable_stealth:
+        # Keep WebGL working (via SwiftShader) when any stealth path is active:
+        # - enable_stealth: playwright-stealth JS-layer patches
+        # - use_undetected: Patchright binary-level patches (Cloudflare 等会查 UNMASKED_RENDERER)
+        if not config.enable_stealth and not use_undetected:
             flags.extend([
                 "--disable-gpu",
                 "--disable-gpu-compositing",
@@ -392,7 +394,11 @@ class ManagedBrowser:
             if self.browser_config.viewport_height and self.browser_config.viewport_width:
                 flags.append(f"--window-size={self.browser_config.viewport_width},{self.browser_config.viewport_height}")
             # merge common launch flags
-            flags.extend(self.build_browser_flags(self.browser_config))
+            # use_undetected=False: ManagedBrowser 仅用于 builtin/docker 模式。
+            #   builtin: enable_stealth 被禁，不需保留 WebGL
+            #   docker:  cdp_url 预设，ManagedBrowser.start() 不会被调用
+            # 因此没有路径需要 undetected ↔ 保留 GPU。
+            flags.extend(self.build_browser_flags(self.browser_config, False))
         elif self.browser_type == "firefox":
             flags = [
                 "--remote-debugging-port",
@@ -846,7 +852,7 @@ class BrowserManager:
             )
             cli_args = [
                 flag
-                for flag in ManagedBrowser.build_browser_flags(self.config)
+                for flag in ManagedBrowser.build_browser_flags(self.config, self.use_undetected)
                 if not flag.startswith(_skip_prefixes)
             ]
             if self.config.extra_args:
@@ -859,6 +865,11 @@ class BrowserManager:
                 "ignore_https_errors": self.config.ignore_https_errors,
                 "accept_downloads": self.config.accept_downloads,
             }
+            # user_agent_mode="browser_default" 时不传 user_agent，让 Chromium 派发原生 UA
+            # + 原生 Sec-CH-UA。浏览器升级后 UA 自动跟新，无需手动维护版本号，
+            # 也避免硬编码 UA 与真实 Chromium 版本不一致触发 CF 等反爬。
+            if getattr(self.config, "user_agent_mode", None) == "browser_default":
+                launch_kwargs["user_agent"] = None
             # no_viewport=True 关闭 Playwright 强制 emulation，页面渲染区跟随 OS 窗口
             # （反爬：innerWidth/screen/outerWidth 等指标天然一致）。注意：之后任何
             # page.set_viewport_size() 调用（如 adjust_viewport_to_content / scroller
@@ -1087,10 +1098,17 @@ class BrowserManager:
 
     def _build_browser_args(self) -> dict:
         """Build browser launch arguments from config."""
+        # GPU flags 同 _build_chromium_args：stealth / undetected 路径下保留 WebGL，
+        # 避免 Cloudflare 等反爬检测到 SwiftShader/无 WebGL context。
+        gpu_flags = []
+        if not self.config.enable_stealth and not self.use_undetected:
+            gpu_flags = [
+                "--disable-gpu",
+                "--disable-gpu-compositing",
+                "--disable-software-rasterizer",
+            ]
         args = [
-            "--disable-gpu",
-            "--disable-gpu-compositing",
-            "--disable-software-rasterizer",
+            *gpu_flags,
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--no-first-run",
@@ -1243,7 +1261,8 @@ class BrowserManager:
                 ] = self.config.downloads_path
 
         # Handle user agent and browser hints
-        if self.config.user_agent:
+        # browser_default 模式：不下发 User-Agent / sec-ch-ua header，让 Chromium 原生派发
+        if self.config.user_agent and getattr(self.config, "user_agent_mode", None) != "browser_default":
             combined_headers = {
                 "User-Agent": self.config.user_agent,
                 "sec-ch-ua": self.config.browser_hint,

@@ -551,7 +551,13 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         # changing it here would only desync browser_config from reality.
         # Users should set user_agent or user_agent_mode on BrowserConfig.
         ua_changed = False
-        if not self.browser_config.use_persistent_context:
+        # browser_default 模式（BrowserConfig 或 RunConfig 任一开启）：完全跳过 UA 注入，
+        # 让 Chromium 原生 UA + Sec-CH-UA 透传，避免覆写造成的版本号不一致。
+        _browser_default_ua = (
+            getattr(self.browser_config, "user_agent_mode", None) == "browser_default"
+            or getattr(config, "user_agent_mode", None) == "browser_default"
+        )
+        if not self.browser_config.use_persistent_context and not _browser_default_ua:
             user_agent_to_override = config.user_agent
             if user_agent_to_override:
                 self.browser_config.user_agent = user_agent_to_override

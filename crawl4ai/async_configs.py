@@ -912,11 +912,19 @@ class BrowserConfig:
             self.user_agent = fa_user_agenr_generator.generate(
                 **(self.user_agent_generator_config or {})
             )
+        elif self.user_agent_mode == "browser_default":
+            # 不设 user_agent，让 Chromium 自己派发原生 UA + Sec-CH-UA
+            # （浏览器版本升级时 UA 自动跟新，避免硬编码版本号过期触发反爬）
+            self.user_agent = None
         else:
             pass
 
-        self.browser_hint = UAGen.generate_client_hints(self.user_agent)
-        self.headers.setdefault("sec-ch-ua", self.browser_hint)
+        # browser_default 模式：不派生 sec-ch-ua，让浏览器原生 header 通过
+        if self.user_agent_mode == "browser_default":
+            self.browser_hint = None
+        else:
+            self.browser_hint = UAGen.generate_client_hints(self.user_agent)
+            self.headers.setdefault("sec-ch-ua", self.browser_hint)
 
         # Set appropriate browser management flags based on browser_mode
         if self.browser_mode == "builtin":
