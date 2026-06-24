@@ -9,7 +9,17 @@
 #       -f deploy/docker/Dockerfile.custom .
 # ============================================================
 
+# 全局 ARG 必须在所有 FROM 之前声明，否则只对单个 stage 可见，
+# 后续 `FROM ${BASE_IMAGE}` 会解析成空字符串。
 ARG BASE_IMAGE=docker.1ms.run/unclecode/crawl4ai:latest
+
+# DRI3-patched Xvfb 二进制源（LSIO 维护）
+# 原版 Xvfb 帧缓冲走 SHM，无法把 DRI3 接到 GPU；这版打了 21-xvfb-dri3.patch，
+# 启用 `-vfbdevice /dev/dri/renderD128` 让帧缓冲走 GBM/DRM，Chrome 才能拿到真正的
+# GPU 合成路径（否则即使装了 Mesa iris 也只能 swrast 软件光栅）。
+# 二进制是用 bookworm 自带 xorg-server 源码 + patch + debuild 编出来的，ABI 严格匹配本基础镜像。
+FROM lscr.io/linuxserver/xvfb:debianbookworm AS xvfb_dri3
+
 FROM ${BASE_IMAGE}
 
 USER root
@@ -39,7 +49,15 @@ RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
 # + Mesa DRI/GLX/EGL 用户态驱动（容器需通过 /dev/dri 直通宿主 GPU 才有意义）：
 #   - libgl1-mesa-dri 提供 iris_dri.so（Intel Gen11+，含 TS-464C2 的 Jasper Lake UHD）
 #   - libglx-mesa0/libegl-mesa0 提供 GLX/EGL → Mesa 桥接
+#   - libepoxy0 是 DRI3-patched Xvfb 的运行时依赖（patch 把 glamor 链了 libepoxy）
 #   - mesa-utils 提供 glxinfo，便于容器内验证（DISPLAY=:99 glxinfo | grep renderer）
+#
+# + 反爬字体补齐（CreepJS / Akamai 会探测字体集判断"非常规桌面"）：
+#   - fonts-liberation 提供 Arial/Times New Roman/Courier New 的开源替代，
+#     补足 CreepJS Headless 探针的 "platform hints: Arial" 缺失（headless 评分降到 0%）。
+#   - fonts-noto-color-emoji 修复 emoji 渲染乱码（容器默认无彩色 emoji 字体，
+#     CreepJS Emojis/Fonts 块会拿到非真实桌面 Chrome 的指纹）。
+#   - fonts-noto-cjk 中日韩字体兜底，避免抓 CJK 页面时 □□□ 占位。
 #
 # 故意不装的：intel-media-va-driver-non-free + libva2（VAAPI 视频硬解码）
 #   - neko/runtime/Dockerfile.intel 装这两个是为了 GStreamer 用 VAAPI 编码 WebRTC 推流。
@@ -48,9 +66,18 @@ RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
 #     内容），VAAPI 能省解码 CPU。届时再加 `intel-media-va-driver-non-free libva2`。
 #     现在不加，避免镜像膨胀。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        iproute2 socat x11vnc \
-        libgl1-mesa-dri libglx-mesa0 libegl-mesa0 mesa-utils \
+        iproute2 x11vnc \
+        libgl1-mesa-dri libglx-mesa0 libegl-mesa0 libepoxy0 mesa-utils \
+        fonts-liberation fonts-noto-color-emoji fonts-noto-cjk \
+    && fc-cache -f \
     && rm -rf /var/lib/apt/lists/*
+
+# 覆盖发行版 Xvfb 为 DRI3-patched 版本（仅二进制覆盖，~3MB，零附带文件）。
+# 必须放在上面 apt 安装之后，否则 apt 可能拉新依赖时重装 xvfb 包覆盖回去。
+COPY --from=xvfb_dri3 /usr/bin/Xvfb /usr/bin/Xvfb
+RUN /usr/bin/Xvfb -help 2>&1 | grep -q vfbdevice \
+    && echo "✅ Xvfb DRI3 patch verified (-vfbdevice available)" \
+    || (echo "❌ Patched Xvfb missing -vfbdevice flag" && exit 1)
 
 ARG GITHUB_REPO=https://github.com/wchy1128/crawl4ai.git
 ARG GITHUB_BRANCH=main
