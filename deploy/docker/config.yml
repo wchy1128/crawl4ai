@@ -91,8 +91,8 @@ crawler:
       user_data_dir: ".\\profiles_tmp"  # 持久化浏览器用户数据目录
       headless: false
       text_mode: false
-      viewport_width: 1903                  # 略小于 Xvfb screen (1920)，模拟真实浏览器 chrome 边框 17px
-      viewport_height: 969                  # 略小于 Xvfb screen (1080)，模拟标题栏+地址栏 111px
+      viewport_width: 1912                  # 略小于 Xvfb screen (1920)，模拟真实浏览器 chrome 边框 17px
+      viewport_height: 949                  # 略小于 Xvfb screen (1080)，模拟标题栏+地址栏 111px
       no_viewport: true   # 关闭 Playwright 强制 viewport emulation，页面渲染区跟随 OS 窗口
       enable_stealth: false              # Patchright 已在二进制层处理，playwright-stealth 反而冲突
       user_agent_mode: "browser_default" # 用 Chromium 原生 UA + Sec-CH-UA（升级浏览器自动跟新版本号，避免硬编码 Chrome 116 与 Patchright 真实版本不一致被 CF 识破）
@@ -115,7 +115,23 @@ crawler:
       # - "--ignore-certificate-errors"
       # - "--disable-software-rasterizer"
       - "--window-position=0,0"
-      - "--window-size=1903,969"
+      - "--window-size=1912,949"
+      # WebRTC IP 泄漏防护：禁止非代理 UDP，防止 STUN srflx 暴露容器真实出口 IP
+      # （CreepJS / FingerprintJS / botd 都会读 RTCPeerConnection 的 srflx 候选地址）。
+      # 副作用：WebRTC 音视频/数据通道无法直连，仅 TURN 中继可用——抓页面用例不受影响。
+      - "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
+      - "--webrtc-ip-handling-policy=disable_non_proxied_udp"
+      # GPU 兜底（暂注释预留；前提：Dockerfile.custom 已装 Mesa iris + COPY 了
+      # DRI3-patched Xvfb，supervisord.conf 用 `-vfbdevice /dev/dri/renderD128`
+      # 启动 X server，且实测 chrome://gpu 仍非全硬件加速时再放开）。
+      # 不加这些 Chromium 仍能用 DRI3 走 GPU 合成，但 WebGL/Canvas 默认走 SwiftShader：
+      # - --use-gl=angle + --use-angle=gl：把 ANGLE 后端从 swiftshader 切到原生 GL（→ Mesa iris）
+      # - --enable-gpu-rasterization：强制 2D Canvas 走 GPU 光栅化
+      # - --ignore-gpu-blocklist：绕过 Chromium 对 Mesa/Jasper Lake 等的内置 blocklist
+      # - "--use-gl=angle"
+      # - "--use-angle=gl"
+      # - "--enable-gpu-rasterization"
+      # - "--ignore-gpu-blocklist"
   run_config:
     stream: false
     simulate_user: true
@@ -132,7 +148,7 @@ crawler:
     
     flatten_shadow_dom: true            # 大网页可能增加耗时，html内容膨胀
 
-    scan_full_page: true
+    scan_full_page: false
     scroll_delay: 0.3                   # 稍长的滚动间隔，更像人类
     max_scroll_steps: 15
     accumulate_on_scroll: false           # 虚拟列表页面滚动时累积克隆内容（如 x.com）
