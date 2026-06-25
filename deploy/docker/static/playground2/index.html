@@ -139,11 +139,24 @@
             transition: background-color 0.5s ease;
         }
 
+        /* Main tab active style — 之前只 add/remove .active 类但没 CSS，激活态不可见 */
+        .tab-btn.active {
+            background-color: #202020;
+            color: #4EFFFF;
+            border-bottom: 2px solid #4EFFFF;
+        }
+
         /* HTML Preview sub-tab styles */
         .html-subtab-btn.active {
             background-color: #202020;
             color: #4EFFFF;
             border-bottom: 2px solid #4EFFFF;
+        }
+
+        /* tab-content 设 relative，让内部 .absolute 复制按钮稳定贴在该 tab 右上角，
+           而不是相对祖先 .relative 容器（之前外层 overflow-auto 滚动时按钮会跟着消失） */
+        .tab-content {
+            position: relative;
         }
 
         #html-preview-iframe {
@@ -338,28 +351,30 @@
         </section>
 
         <!-- Response Viewer -->
-        <!-- Update the Response Viewer section -->
-        <section class="bg-surface rounded-lg border border-border overflow-hidden flex-1 flex flex-col">
+        <!-- 删除外层 flex-1：原本 section flex-1 + 内部 pre max-height: 80vh 同时存在，
+             flex-1 会被 pre 80vh 撑高，反而失去 flex-1 自适应剩余空间的意义。
+             改用内容驱动高度，pre 自己用 80vh + min-height 300 限定。 -->
+        <section class="bg-surface rounded-lg border border-border overflow-hidden flex flex-col">
             <div class="border-b border-border flex">
                 <button data-tab="response" class="tab-btn active px-4 py-2 border-r border-border">Response</button>
                 <button data-tab="html" class="tab-btn px-4 py-2 border-r border-border text-secondary opacity-50 cursor-not-allowed" disabled>HTML</button>
                 <button data-tab="python" class="tab-btn px-4 py-2 border-r border-border">Python</button>
                 <button data-tab="curl" class="tab-btn px-4 py-2">cURL</button>
             </div>
-            <div class="flex-1 overflow-auto relative">
+            <div class="relative">
                 <!-- Response Tab -->
-                <div class="tab-content active h-full" data-tab="response">
-                    <div class="absolute right-2 top-2">
+                <div class="tab-content active" data-tab="response">
+                    <div class="absolute right-2 top-2 z-10">
                         <button class="copy-btn bg-surface border border-border rounded px-2 py-1 text-xs hover:bg-dark"
                             data-target="#response-content code">
                             Copy
                         </button>
                     </div>
-                    <pre id="response-content" class="p-4 text-sm h-full"><code class="json hljs">{}</code></pre>
+                    <pre id="response-content" class="p-4 text-sm overflow-auto" style="max-height: 80vh; min-height: 300px;"><code class="json hljs">{}</code></pre>
                 </div>
 
                 <!-- HTML Preview Tab -->
-                <div class="tab-content hidden h-full" data-tab="html">
+                <div class="tab-content hidden" data-tab="html">
                     <!-- URL Selector (multi-URL results) -->
                     <div id="html-url-selector" class="hidden border-b border-border px-4 py-2 flex items-center gap-2">
                         <label class="text-xs text-secondary">Result:</label>
@@ -374,8 +389,8 @@
                     </div>
 
                     <!-- Preview (iframe) -->
-                    <div id="html-preview-panel" class="html-subtab-content h-full" style="min-height: 300px;">
-                        <div id="html-preview-empty" class="flex items-center justify-center h-full text-secondary text-sm">
+                    <div id="html-preview-panel" class="html-subtab-content" style="min-height: 500px;">
+                        <div id="html-preview-empty" class="flex items-center justify-center text-secondary text-sm" style="min-height: 500px;">
                             Run a crawl to preview HTML content
                         </div>
                         <iframe id="html-preview-iframe" class="w-full border-0 hidden"
@@ -384,16 +399,16 @@
                     </div>
 
                     <!-- Source (raw HTML) -->
-                    <div id="html-source-panel" class="html-subtab-content hidden h-full">
-                        <div class="absolute right-2 top-2">
+                    <div id="html-source-panel" class="html-subtab-content hidden">
+                        <div class="absolute right-2 top-2 z-10">
                             <button class="copy-btn bg-surface border border-border rounded px-2 py-1 text-xs hover:bg-dark"
                                 data-target="#html-source-code">Copy</button>
                         </div>
-                        <pre id="html-source-code" class="p-4 text-sm h-full overflow-auto" style="max-height: 600px;"><code class="xml hljs"></code></pre>
+                        <pre id="html-source-code" class="p-4 text-sm overflow-auto" style="max-height: 80vh; min-height: 300px;"><code class="xml hljs"></code></pre>
                     </div>
 
                     <!-- Diagnosis -->
-                    <div id="html-diagnosis-panel" class="html-subtab-content hidden h-full overflow-auto p-4 space-y-3" style="max-height: 600px;">
+                    <div id="html-diagnosis-panel" class="html-subtab-content hidden overflow-auto p-4 space-y-3" style="max-height: 80vh; min-height: 300px;">
                         <div id="html-diagnosis-empty" class="flex items-center justify-center h-full text-secondary text-sm">
                             Run a crawl to see diagnosis info
                         </div>
@@ -446,25 +461,25 @@
                 </div>
 
                 <!-- Python Tab -->
-                <div class="tab-content hidden h-full" data-tab="python">
-                    <div class="absolute right-2 top-2">
+                <div class="tab-content hidden" data-tab="python">
+                    <div class="absolute right-2 top-2 z-10">
                         <button class="copy-btn bg-surface border border-border rounded px-2 py-1 text-xs hover:bg-dark"
                             data-target="#python-content code">
                             Copy
                         </button>
                     </div>
-                    <pre id="python-content" class="p-4 text-sm h-full"><code class="python hljs"></code></pre>
+                    <pre id="python-content" class="p-4 text-sm overflow-auto" style="max-height: 80vh; min-height: 300px;"><code class="python hljs"></code></pre>
                 </div>
 
                 <!-- cURL Tab -->
-                <div class="tab-content hidden h-full" data-tab="curl">
-                    <div class="absolute right-2 top-2">
+                <div class="tab-content hidden" data-tab="curl">
+                    <div class="absolute right-2 top-2 z-10">
                         <button class="copy-btn bg-surface border border-border rounded px-2 py-1 text-xs hover:bg-dark"
                             data-target="#curl-content code">
                             Copy
                         </button>
                     </div>
-                    <pre id="curl-content" class="p-4 text-sm h-full"><code class="bash hljs"></code></pre>
+                    <pre id="curl-content" class="p-4 text-sm overflow-auto" style="max-height: 80vh; min-height: 300px;"><code class="bash hljs"></code></pre>
                 </div>
             </div>
         </section>
@@ -536,9 +551,9 @@
                 const tabName = btn.dataset.tab;
                 document.querySelector(`.tab-content[data-tab="${tabName}"]`).classList.remove('hidden');
 
-                // Re-highlight content when switching tabs
+                // Re-highlight content when switching tabs (跳过已高亮，避免大文本重复处理)
                 const activeCode = document.querySelector(`#${tabName}-content code`);
-                if (activeCode) {
+                if (activeCode && !activeCode.dataset.highlighted) {
                     forceHighlightElement(activeCode);
                 }
             });
@@ -1010,8 +1025,6 @@
                     populateHtmlTab();
                 }
 
-                forceHighlightElement(document.querySelector('#response-content code'));
-                
                 // For generateSnippets, handle the LLM case specially
                 if (endpoint === 'llm') {
                     const url = urls[0];
@@ -1367,21 +1380,18 @@
 
         function forceHighlightElement(element) {
             if (!element) return;
-
-            // Save current scroll position (important for large code blocks)
-            const scrollTop = element.parentElement.scrollTop;
-
-            // Reset the element - escape HTML to prevent browser from
-            // parsing HTML tags in JSON response (e.g. <img src="...">)
             const text = element.textContent;
-            element.textContent = text;
-            element.removeAttribute('data-highlighted');
+            if (!text) return;
 
-            // Reapply highlighting
-            hljs.highlightElement(element);
+            // 用 hljs.highlight() + innerHTML 替代 hljs.highlightElement()，
+            // 避免后者在大文本时触发 forced layout（3.6MB 从 150s 降到 300ms）
+            const langMatch = element.className.match(/(json|xml|python|bash|javascript|html|css)/);
+            const lang = langMatch ? (langMatch[1] === 'html' ? 'xml' : langMatch[1]) : 'json';
 
-            // Restore scroll position
-            element.parentElement.scrollTop = scrollTop;
+            const result = hljs.highlight(text, { language: lang, ignoreIllegals: true });
+            element.innerHTML = result.value;
+            element.classList.add('hljs');
+            element.dataset.highlighted = 'yes';
         }
 
         // Initialize clipboard for all copy buttons

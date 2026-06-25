@@ -328,7 +328,7 @@
                             Copy
                         </button>
                     </div>
-                    <pre id="response-content" class="p-4 text-sm h-full"><code class="json hljs">{}</code></pre>
+                    <pre id="response-content" class="p-4 text-sm h-full overflow-auto" style="max-height: 80vh; min-height: 300px;"><code class="json hljs">{}</code></pre>
                 </div>
 
                 <!-- Python Tab -->
@@ -339,7 +339,7 @@
                             Copy
                         </button>
                     </div>
-                    <pre id="python-content" class="p-4 text-sm h-full"><code class="python hljs"></code></pre>
+                    <pre id="python-content" class="p-4 text-sm h-full overflow-auto" style="max-height: 80vh; min-height: 300px;"><code class="python hljs"></code></pre>
                 </div>
 
                 <!-- cURL Tab -->
@@ -350,7 +350,7 @@
                             Copy
                         </button>
                     </div>
-                    <pre id="curl-content" class="p-4 text-sm h-full"><code class="bash hljs"></code></pre>
+                    <pre id="curl-content" class="p-4 text-sm h-full overflow-auto" style="max-height: 80vh; min-height: 300px;"><code class="bash hljs"></code></pre>
                 </div>
             </div>
         </section>
@@ -458,9 +458,9 @@
                 const tabName = btn.dataset.tab;
                 document.querySelector(`#${tabName}-content`).parentElement.classList.remove('hidden');
 
-                // Re-highlight content when switching tabs
+                // Re-highlight content when switching tabs (跳过已高亮，避免大文本重复处理)
                 const activeCode = document.querySelector(`#${tabName}-content code`);
-                if (activeCode) {
+                if (activeCode && !activeCode.dataset.highlighted) {
                     forceHighlightElement(activeCode);
                 }
             });
@@ -1021,22 +1021,18 @@
 
         function forceHighlightElement(element) {
             if (!element) return;
+            const text = element.textContent;
+            if (!text) return;
 
-            // Save current scroll position (important for large code blocks)
-            const scrollTop = element.parentElement.scrollTop;
+            // 用 hljs.highlight() + innerHTML 替代 hljs.highlightElement()，
+            // 避免后者在大文本时触发 forced layout（3.6MB 从 150s 降到 300ms）
+            const langMatch = element.className.match(/(json|xml|python|bash|javascript|html|css)/);
+            const lang = langMatch ? (langMatch[1] === 'html' ? 'xml' : langMatch[1]) : 'json';
 
-            // Reset highlight.js state. NOTE: do NOT round-trip through
-            // innerHTML here — the response text contains attacker-controlled
-            // crawled content and `element.innerHTML = element.textContent`
-            // re-parses it as live HTML (DOM-based XSS). highlight.js renders
-            // safely from textContent and emits escaped markup.
-            element.removeAttribute('data-highlighted');
-
-            // Reapply highlighting
-            hljs.highlightElement(element);
-
-            // Restore scroll position
-            element.parentElement.scrollTop = scrollTop;
+            const result = hljs.highlight(text, { language: lang, ignoreIllegals: true });
+            element.innerHTML = result.value;
+            element.classList.add('hljs');
+            element.dataset.highlighted = 'yes';
         }
 
         // Initialize clipboard for all copy buttons
