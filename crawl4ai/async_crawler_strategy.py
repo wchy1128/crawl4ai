@@ -2201,16 +2201,31 @@ Element.prototype.attachShadow = function(init) {
                         # )
                         
                         # """ NEW VERSION:
-                        # When {script} contains statements (e.g., const link = …; link.click();), 
+                        # When {script} contains statements (e.g., const link = …; link.click();),
                         # this forms invalid JavaScript, causing Playwright execution error: SyntaxError: Unexpected token 'const'.
-                        # """
+                        #
+                        # The user script is wrapped inside an inner async IIFE so statements stay
+                        # legal. The IIFE's return value (i.e. the value of a bare `return x;`
+                        # statement in the user script) is captured into __c4a_result and carried
+                        # out in a uniform { success, result } envelope, so every result entry has
+                        # the same shape and consumers (e.g. crawlers/google_search) can always
+                        # read results[i]["result"] without guessing whether it is a bare scalar,
+                        # a {success:True}-only flag, or an error dict.
+                        #
+                        # Note (JS language limit): a script that is a pure expression or IIFE
+                        # *without* a top-level return — e.g. `(() => { return x; })()` or
+                        # `document.title` — evaluates to a value but the inner function body has
+                        # no return, so __c4a_result is `undefined` (None in Python). This is an
+                        # inherent JS limitation, not a bug; to carry a value back the script must
+                        # use a top-level `return`.
                         result = await self.adapter.evaluate(page,
                             f"""
                         (async () => {{
                             try {{
-                                return await (async () => {{
+                                const __c4a_result = await (async () => {{
                                     {script}
                                 }})();
+                                return {{ success: true, result: __c4a_result }};
                             }} catch (err) {{
                                 return {{ success: false, error: err.toString(), stack: err.stack }};
                             }}

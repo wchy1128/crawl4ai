@@ -154,11 +154,41 @@ async def test_js_code_modifies_dom(local_server):
         assert "Injected by JS" in combined, (
             "Injected content should appear in HTML or markdown"
         )
+        # A statement-style script (no return) still yields a uniform envelope:
+        # { success: True, result: None }. This guards the contract for the most
+        # common js_code usage (side effects, not return values).
+        entry = result.js_execution_result["results"][0]
+        assert isinstance(entry, dict) and entry.get("success") is True, (
+            f"side-effect script entry must be a {{success:True,...}} envelope; got {entry!r}"
+        )
 
 
 @pytest.mark.asyncio
 async def test_js_code_returns_value(local_server):
-    """Execute JS that returns document.title and check js_execution_result."""
+    """A bare-top-level `return x;` script MUST carry its value in a strict
+    { success, result } envelope.
+
+    Regression guard. robust_execute_user_script wraps the user script inside an
+    inner async IIFE and captures its return value into an envelope:
+
+        const __c4a_result = await (async () => { <script> })();
+        return { success: true, result: __c4a_result };
+
+    A bare `return x;` lives directly in the inner function body, so its value
+    flows out as `__c4a_result` and is carried back under the "result" key.
+
+    Before the fix the wrapper returned the value as a BARE SCALAR (e.g. the raw
+    string "Crawl4AI Test Home") with NO envelope, so consumers reading
+    results[i]["result"] broke with a TypeError and the per-script schema was
+    inconsistent. This test pins the strict envelope shape so that regression
+    cannot return: results[0] MUST be a dict with `success` True and `result`
+    holding the title. A bare scalar fails the very first isinstance check.
+
+    NOTE on usage contract: the supported way to carry a value back from js_code
+    is a top-level `return`. An IIFE/expression like `(() => { return x; })()`
+    is NOT supported — its value is unreachable by JS design (the inner function
+    body has no return) and is not covered here on purpose.
+    """
     config = CrawlerRunConfig(
         js_code="return document.title;",
         verbose=False,
@@ -166,28 +196,75 @@ async def test_js_code_returns_value(local_server):
     async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
         result = await crawler.arun(url=local_server + "/", config=config)
         assert result.success, f"JS return value crawl failed: {result.error_message}"
-        # js_execution_result should contain the returned value
-        if result.js_execution_result is not None:
-            # The result might be stored under a key or directly
-            result_str = str(result.js_execution_result)
-            assert "Crawl4AI Test Home" in result_str or len(result_str) > 0, (
-                "js_execution_result should contain the document title"
-            )
+        assert result.js_execution_result is not None, (
+            "js_execution_result must be populated when js_code runs"
+        )
+        entry = result.js_execution_result["results"][0]
+        assert isinstance(entry, dict), (
+            f"result entry must be a {{success, result}} envelope, not a bare scalar; "
+            f"got {entry!r} — this is the no-envelope regression"
+        )
+        assert entry.get("success") is True, f"entry success expected True; got {entry!r}"
+        assert "result" in entry, (
+            f"entry must carry the value under 'result'; a {{success:True}}-only entry "
+            f"means the value was dropped — got {entry!r}"
+        )
+        assert "Crawl4AI Test Home" in str(entry["result"]), (
+            f"expected document.title under 'result'; got {entry['result']!r}"
+        )
 
 
 @pytest.mark.asyncio
 async def test_multiple_js_scripts(local_server):
-    """Execute multiple JS scripts sequentially; last one sets title to 'B'."""
+    """A list of bare scripts: each result entry MUST be a { success, result }
+    envelope, and a trailing `return` carries the final value back.
+
+    The old version of this test asserted nothing (only result.success), so it
+    could not catch the no-envelope regression. Now it pins that every list
+    entry is a dict envelope and that the final script's return value flows out.
+    """
     config = CrawlerRunConfig(
-        js_code=["document.title='A';", "document.title='B';"],
+        js_code=["document.title='A';", "return document.title;"],
         verbose=False,
     )
     async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
         result = await crawler.arun(url=local_server + "/", config=config)
         assert result.success, f"Multiple JS scripts crawl failed: {result.error_message}"
-        # Both scripts should have executed; title should end up as 'B'
-        # We can check via the HTML title tag or via another JS execution
-        # The HTML might still have the original title in source, but the page state changed
+        entries = result.js_execution_result["results"]
+        assert len(entries) == 2, f"expected 2 per-script results; got {entries!r}"
+        for e in entries:
+            assert isinstance(e, dict) and e.get("success") is True, (
+                f"every list entry must be a {{success:True,...}} envelope; got {e!r}"
+            )
+        # second script returns the title that the first script set to 'A'
+        assert entries[1]["result"] == "A", (
+            f"second script should return title 'A'; got {entries[1]!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_js_code_falsy_return_preserved(local_server):
+    """A legitimate falsy return value (0) MUST be preserved in the envelope,
+    not swallowed into a bare { success: True }.
+
+    Before the envelope fix the Python layer did `results.append(result if
+    result else {"success": True})`: `0` is falsy in Python, so `return 0;`
+    collapsed to a {success:True}-only entry and the value 0 was lost. The
+    envelope now wraps the value as { success: True, result: 0 } regardless of
+    truthiness, which this test pins.
+    """
+    config = CrawlerRunConfig(js_code="return 0;", verbose=False)
+    async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False)) as crawler:
+        result = await crawler.arun(url=local_server + "/", config=config)
+        assert result.success, f"falsy-return crawl failed: {result.error_message}"
+        entry = result.js_execution_result["results"][0]
+        assert isinstance(entry, dict) and entry.get("success") is True, (
+            f"entry must be a {{success:True,...}} envelope; got {entry!r}"
+        )
+        assert "result" in entry and entry["result"] == 0, (
+            f"legitimate falsy return 0 must be preserved as {{success:True,result:0}}; "
+            f"got {entry!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -341,12 +418,27 @@ async def test_session_persistence(local_server):
         result2 = await crawler.arun(url=local_server + "/", config=config2)
         assert result2.success, f"Second session crawl failed: {result2.error_message}"
 
-        # Check if testVar persisted
-        if result2.js_execution_result is not None:
-            result_str = str(result2.js_execution_result)
-            assert "hello" in result_str, (
-                f"Session variable should persist; got: {result_str}"
-            )
+        # Check if testVar persisted. The return value of the second crawl's
+        # js_code ("return window.__testVar;") MUST be carried in a strict
+        # { success, result } envelope, not just a success flag. Before the fix
+        # the value came back as a bare scalar with no envelope; the isinstance +
+        # "result" key checks fail on that bare-scalar shape, so the value-loss
+        # regression cannot pass silently.
+        assert result2.js_execution_result is not None, (
+            "js_execution_result must be populated when js_code runs"
+        )
+        entry = result2.js_execution_result["results"][0]
+        assert isinstance(entry, dict), (
+            f"result entry must be a {{success, result}} envelope, not a bare scalar; "
+            f"got {entry!r}"
+        )
+        assert entry.get("success") is True, f"entry success expected True; got {entry!r}"
+        assert "result" in entry, (
+            f"entry must carry the value under 'result'; got {entry!r}"
+        )
+        assert "hello" in str(entry["result"]), (
+            f"Session variable should persist; got result={entry['result']!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
