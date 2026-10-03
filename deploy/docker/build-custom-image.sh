@@ -15,9 +15,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 BASE_IMAGE="${BASE_IMAGE:-docker.1ms.run/unclecode/crawl4ai:latest}"
-TAG="${TAG:-crawl4ai-wchy-dev:latest}"
 GITHUB_REPO="${GITHUB_REPO:-https://github.com/wchy1128/crawl4ai.git}"
 GITHUB_BRANCH="${GITHUB_BRANCH:-wchy_dev}"
+
+# 镜像 tag 默认用远程分支 HEAD 的短 commit id（构建的代码真实来源）
+# 仍可手动覆盖：TAG=xxx 或 COMMIT=<完整sha> bash build-custom-image.sh
+COMMIT="${COMMIT:-$(git ls-remote "${GITHUB_REPO}" "refs/heads/${GITHUB_BRANCH}" | awk '{print $1}')}"
+TAG="${TAG:-crawl4ai-wchy-dev:$(date +%Y%m%d-%H%M)-${COMMIT:0:7}}"
 
 # Build-time proxy (optional). Set HTTP_PROXY/HTTPS_PROXY in the shell to speed
 # up apt/pip/git downloads during build. Only passed as --build-arg, NOT baked
