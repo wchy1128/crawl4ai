@@ -723,13 +723,16 @@ class PruningContentFilter(RelevantContentFilter):
             return
 
         # Skip pruning for preserved nodes — always keep them.
-        # Also skip <pre>/<code>: syntax highlighters (e.g. Sandpack) wrap every
-        # token in short-text <span>s whose text_density gets pruned, losing code.
-        if self._is_preserved(node) or node.name in ("pre", "code"):
+        # Also skip <pre>/<code> subtrees: syntax highlighters (e.g. Sandpack)
+        # wrap every token in short-text <span>s whose text_density gets
+        # pruned, losing code. <td>/<th> cells are short, link-dense text that
+        # the article-oriented formula misjudges (e.g. drops a country-name
+        # column while keeping numeric cells of the same table).
+        if self._is_preserved(node) or node.name in ("pre", "code", "td", "th"):
             return
 
         text_len = len(node.get_text(strip=True))
-        tag_len = len(node.encode_contents().decode("utf-8"))
+        tag_len = self._effective_content_len(node)
         link_text_len = sum(
             len(s.strip())
             for s in (a.string for a in node.find_all("a", recursive=False))
@@ -769,6 +772,21 @@ class PruningContentFilter(RelevantContentFilter):
             children = [child for child in node.children if hasattr(child, "name")]
             for child in children:
                 self._prune_tree(child)
+
+    def _effective_content_len(self, node) -> int:
+        """Serialized inner length with ``<a href="...">`` targets excluded.
+
+        The length of an href says nothing about the content value of the text
+        it wraps: counting it dilutes text_density for short labels inside
+        long-href links (parity with PruningContentFilterLXML._outer_len).
+        """
+        total = len(node.encode_contents().decode("utf-8"))
+        for a in node.find_all("a"):
+            href = a.get("href")
+            if href:
+                # ' href="value"' contribution: 4 + len('href') + len(value)
+                total -= 8 + len(href)
+        return max(total, 0)
 
     def _compute_composite_score(self, metrics, text_len, tag_len, link_text_len):
         """Computes the composite score"""

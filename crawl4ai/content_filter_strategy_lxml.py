@@ -151,6 +151,13 @@ class PruningContentFilterLXML(PruningContentFilter):
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
+    # Tags whose entire subtree is exempt from pruning. Table cells are
+    # naturally short-text and link-dense, so the article-oriented scoring
+    # formula misjudges them (e.g. drops a whole country-name column while
+    # keeping numeric cells). Code blocks are atomic: pruning inside them
+    # yields truncated commands rather than "cleaner" code.
+    SUBTREE_IMMUNE_TAGS = frozenset({"pre", "code", "td", "th"})
+
     def filter_content(self, html: str, min_word_threshold: int = None) -> List[str]:
         if not html or not isinstance(html, str):
             return []
@@ -188,18 +195,24 @@ class PruningContentFilterLXML(PruningContentFilter):
 
         # Top-down pass: a node survives only if it and every ancestor up to
         # body pass the threshold. Iterative (explicit stack) to avoid Python
-        # recursion limits on deeply nested documents.
-        stack = [body]
+        # recursion limits on deeply nested documents. Nodes inside an immune
+        # subtree (pre/code/td/th) are kept without scoring, matching the
+        # BeautifulSoup implementation's early-return semantics.
+        stack = [(body, False)]
         while stack:
-            node = stack.pop()
+            node, immune = stack.pop()
             for child in list(node):
                 if not isinstance(child.tag, str):
+                    continue
+                child_immune = immune or child.tag in self.SUBTREE_IMMUNE_TAGS
+                if child_immune:
+                    stack.append((child, True))
                     continue
                 child_metrics = metrics.get(child)
                 if child_metrics is None or self._should_remove(child, child_metrics, metrics):
                     child.drop_tree()  # removes subtree, preserves following text
                 else:
-                    stack.append(child)
+                    stack.append((child, False))
 
         # Collect surviving direct children of body, in document order,
         # skipping any that no longer carry visible text after pruning.
@@ -301,6 +314,11 @@ class PruningContentFilterLXML(PruningContentFilter):
         tag = el.tag
         attrs_len = 0
         for k, v in el.attrib.items():
+            # The length of an href target says nothing about the content
+            # value of the text it wraps: a long URL should not dilute the
+            # text density of a short label (e.g. a table cell country name).
+            if k == "href":
+                continue
             # ' key="value"' -> 1 space + len(key) + '="' + escaped value + '"'
             attrs_len += 4 + len(k) + _esc_len(v)
         tag_len = len(tag)
@@ -313,10 +331,11 @@ class PruningContentFilterLXML(PruningContentFilter):
     # Scoring (top-down pass)
     # ------------------------------------------------------------------ #
     def _should_remove(self, node, m: _NodeMetrics, metrics: Dict[object, _NodeMetrics]) -> bool:
-        # Skip pruning for <pre>/<code> nodes (parity with PruningContentFilter):
-        # syntax highlighters wrap every token in short-text <span>s whose
-        # text_density gets pruned, losing code content.
-        if node.tag in ("pre", "code"):
+        # Skip pruning for subtree-immune nodes (parity with
+        # PruningContentFilter): code blocks hold token spans whose
+        # text_density gets pruned, and td/th cells are short link-dense text
+        # the article formula misjudges.
+        if node.tag in self.SUBTREE_IMMUNE_TAGS:
             return False
 
         text_len = m.text_len

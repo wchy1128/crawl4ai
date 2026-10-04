@@ -514,7 +514,22 @@ class HTML2Text(html.parser.HTMLParser):
             title = ' "{}"'.format(title) if title.strip() else ""
             self.o("]({url}{title})".format(url=escape_md(url), title=title))
 
-        if tag == "a" and not self.ignore_links:
+        if tag == "a" and (self.code or self.pre):
+            # Inside <pre>/<code>, anchors are transparent: code is verbatim
+            # text and must not gain markdown link syntax. The normal anchor
+            # path also corrupts output as "text[](href)" when the anchor text
+            # is followed by a tail (e.g. URL + "?query=..." split by syntax
+            # highlighters), because the "[" marker is suppressed in code mode.
+            if start:
+                self.inside_link = True
+                self.astack.append(None)
+                self.maybe_automatic_link = None
+                self.empty_link = False
+            else:
+                self.inside_link = False
+                if self.astack:
+                    self.astack.pop()
+        elif tag == "a" and not self.ignore_links:
             if start:
                 self.inside_link = True
                 if (
@@ -1146,6 +1161,21 @@ class CustomHTML2Text(HTML2Text):
                 self.preserved_content.append(f"<{tag}{attr_str}>")
             else:
                 self.preserved_content.append(f"</{tag}>")
+            return
+
+        # Inside <pre>/<code>, anchors are transparent: code is verbatim text
+        # and must not gain markdown link syntax. The text itself is emitted
+        # as-is by handle_data's inside_pre/inside_code branches, which bypass
+        # the parent anchor state machine (maybe_automatic_link/empty_link).
+        # If the parent still processed the anchor, its close-tag path would
+        # append a bogus "[](url)" after the already-emitted text (seen as
+        # e.g. `https://google.com[](https://google.com)?q=example` when
+        # syntax highlighters split a URL into anchor + tail).
+        if tag == "a" and (self.inside_pre or self.inside_code):
+            if start:
+                self.inside_link = True
+            else:
+                self.inside_link = False
             return
 
         # Handle pre tags
