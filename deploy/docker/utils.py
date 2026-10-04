@@ -157,7 +157,9 @@ def _deep_merge(base: dict, override: dict) -> dict:
 def load_config() -> Dict:
     """Load and return application configuration with environment variable overrides."""
     config_path = Path(__file__).parent / "config.yml"
-    with open(config_path, "r") as config_file:
+    # YAML files are UTF-8 by spec; on Windows the implicit locale codec is
+    # GBK and any non-ASCII byte in config.yml raises UnicodeDecodeError.
+    with open(config_path, "r", encoding="utf-8") as config_file:
         user_config = yaml.safe_load(config_file) or {}
 
     # Deep-merge user config on top of defaults so missing keys get safe values

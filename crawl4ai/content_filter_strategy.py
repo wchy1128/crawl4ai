@@ -114,6 +114,15 @@ class RelevantContentFilter(ABC):
         self.negative_patterns = re.compile(
             r"nav|footer|header|sidebar|ads|comment|promo|advert|social|share", re.I
         )
+        # High-confidence boilerplate markers, pruned outright regardless of
+        # score: MediaWiki navbox/catlinks/metadata templates survive
+        # score-based pruning because they carry a large volume of text.
+        # Matched per class *token* (exact or hyphen family), never as a
+        # substring inside a longer token (IMDb uses ipc-metadata-list-*).
+        self.hard_noise_tokens = frozenset(
+            {"navbox", "navboxes", "catlinks", "metadata", "sistersitebox"}
+        )
+        self.hard_noise_prefixes = ("navbox-", "catlinks-")
         self.min_word_count = 2
         self.verbose = False
         self.logger = logger
@@ -712,6 +721,12 @@ class PruningContentFilter(RelevantContentFilter):
                 return True
         return False
 
+    def _matches_hard_noise(self, cls: str, nid: str) -> bool:
+        """Exact-token (or hyphen-family) match against hard-noise markers."""
+        toks, prefs = self.hard_noise_tokens, self.hard_noise_prefixes
+        candidates = cls.split() + ([nid] if nid else [])
+        return any(t in toks or t.startswith(prefs) for t in candidates)
+
     def _prune_tree(self, node):
         """
         Prunes the tree starting from the given node.
@@ -731,13 +746,25 @@ class PruningContentFilter(RelevantContentFilter):
         if self._is_preserved(node) or node.name in ("pre", "code", "td", "th"):
             return
 
+        cls = " ".join(node.get("class") or [])
+        nid = node.get("id") or ""
+        if self._matches_hard_noise(cls, nid):
+            node.decompose()
+            return
+
         text_len = len(node.get_text(strip=True))
         tag_len = self._effective_content_len(node)
-        link_text_len = sum(
-            len(s.strip())
-            for s in (a.string for a in node.find_all("a", recursive=False))
-            if s
-        )
+        link_text_len = 0
+        for a in node.find_all("a", recursive=False):
+            s = a.string
+            if not s:
+                continue
+            # Clickable headings (<a><h4>Title</h4></a>) are content, not
+            # navigation: exempt from the link-density penalty. In BS4 the
+            # string's parent is the heading itself; for <a>x</a> it's the a.
+            if s.parent is not None and getattr(s.parent, "name", None) in self.header_tags:
+                continue
+            link_text_len += len(s.strip())
 
         metrics = {
             "node": node,

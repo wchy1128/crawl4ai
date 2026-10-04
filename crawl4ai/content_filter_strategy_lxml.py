@@ -68,6 +68,9 @@ VOID_ELEMENTS = frozenset(
     }
 )
 
+# Heading tags: text reaching ``.string`` through these is content, not link text.
+_HEADING_TAGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
+
 # A single reused parser. ``huge_tree=True`` lifts libxml2's 256-level depth
 # cap (and other limits) so output matches BeautifulSoup on pathological pages.
 _HTML_PARSER = lhtml.HTMLParser(huge_tree=True)
@@ -108,15 +111,20 @@ class _NodeMetrics:
         Length of the stripped BeautifulSoup ``.string`` for this node, or
         ``-1`` when ``.string`` would be ``None``. Used only to evaluate
         ``link_text_len`` over direct-child ``<a>`` elements.
+    string_from_heading:
+        Whether that text originates from a heading (h1-h6); exempt from
+        the link-density penalty (clickable headings are content).
     """
 
-    __slots__ = ("text_len", "inner_len", "space_count", "string_len")
+    __slots__ = ("text_len", "inner_len", "space_count", "string_len", "string_from_heading")
 
-    def __init__(self, text_len: int, inner_len: int, space_count: int, string_len: int):
+    def __init__(self, text_len: int, inner_len: int, space_count: int, string_len: int,
+                 string_from_heading: bool = False):
         self.text_len = text_len
         self.inner_len = inner_len
         self.space_count = space_count
         self.string_len = string_len
+        self.string_from_heading = string_from_heading
 
 
 class PruningContentFilterLXML(PruningContentFilter):
@@ -256,6 +264,7 @@ class PruningContentFilterLXML(PruningContentFilter):
             if txt:
                 stripped = txt.strip()
                 text_len = len(stripped)
+                is_heading = el.tag in _HEADING_TAGS
                 # BeautifulSoup's tree builder collapses an ASCII-whitespace-only
                 # text node to a single character; anything else is kept verbatim.
                 if stripped or txt.strip(_ASCII_WS):
@@ -265,10 +274,12 @@ class PruningContentFilterLXML(PruningContentFilter):
                 space_count = stripped.count(" ") if need_words else 0
                 frag_count = 1
                 string_len = text_len  # candidate, valid only if frag_count == 1
+                string_from_heading = is_heading
             else:
                 text_len = inner_len = space_count = 0
                 frag_count = 0
                 string_len = -1
+                string_from_heading = False
 
             for child in el:
                 ct = child.tag
@@ -282,6 +293,7 @@ class PruningContentFilterLXML(PruningContentFilter):
                         space_count += cm.space_count
                     frag_count += 1
                     string_len = cm.string_len  # recurse if this is the sole content
+                    string_from_heading = cm.string_from_heading
                 # else: comment / excluded element -> removed, contributes 0,
                 # but its trailing text is still a separate fragment below.
 
@@ -299,8 +311,9 @@ class PruningContentFilterLXML(PruningContentFilter):
             # exactly one content fragment.
             if frag_count != 1:
                 string_len = -1
+                string_from_heading = False
 
-            metrics[el] = _NodeMetrics(text_len, inner_len, space_count, string_len)
+            metrics[el] = _NodeMetrics(text_len, inner_len, space_count, string_len, string_from_heading)
 
         return metrics
 
@@ -338,6 +351,10 @@ class PruningContentFilterLXML(PruningContentFilter):
         if node.tag in self.SUBTREE_IMMUNE_TAGS:
             return False
 
+        # Hard-noise markers prune outright regardless of score.
+        if self._matches_hard_noise(node.get("class") or "", node.get("id") or ""):
+            return True
+
         text_len = m.text_len
         tag_len = m.inner_len
 
@@ -345,7 +362,10 @@ class PruningContentFilterLXML(PruningContentFilter):
         for child in node:
             if child.tag == "a":
                 cm = metrics.get(child)
-                if cm is not None and cm.string_len > 0:
+                # Clickable headings (<a><h4>Title</h4></a>) are content,
+                # not navigation: exempt from the link-density penalty.
+                if (cm is not None and cm.string_len > 0
+                        and not cm.string_from_heading):
                     link_text_len += cm.string_len
 
         score = self._composite_score(node, m, text_len, tag_len, link_text_len)
